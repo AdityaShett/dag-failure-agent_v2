@@ -1,0 +1,10 @@
+{
+  "weights": {
+    "stack_trace_present": 0.25,
+    "line_number_matches_source": 0.35,
+    "known_fix_pattern_match": 0.25,
+    "log_completeness": 0.15
+  },
+  "penalty": 0.05,
+  "threshold": 0.7
+}

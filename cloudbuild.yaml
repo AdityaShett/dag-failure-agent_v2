@@ -1,0 +1,17 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "gcr.io/$PROJECT_ID/dag-failure-agent", "."]
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "gcr.io/$PROJECT_ID/dag-failure-agent"]
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - dag-failure-agent
+      - --image=gcr.io/$PROJECT_ID/dag-failure-agent
+      - --region=us-central1
+      - --platform=managed
+      - --no-allow-unauthenticated
+images:
+  - gcr.io/$PROJECT_ID/dag-failure-agent

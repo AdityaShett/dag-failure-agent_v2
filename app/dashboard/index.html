@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>dag-failure-agent</title>
+<style>
+body { font-family: sans-serif; font-size: 14px; margin: 24px; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 32px; }
+th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
+th { background: #f0f0f0; }
+input { width: 90px; }
+form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 32px; }
+form input { width: 180px; }
+h2 { margin-top: 40px; }
+</style>
+</head>
+<body>
+
+<h1>DAG Failure Agent</h1>
+
+<h2>Runs</h2>
+<table id="runs"><thead>
+<tr><th>dag_id</th><th>task_id</th><th>run_id</th><th>status</th><th>confidence</th><th>PR</th></tr>
+</thead><tbody></tbody></table>
+
+<h2>Weights</h2>
+<table id="weights"><thead>
+<tr><th>name</th><th>value</th><th></th></tr>
+</thead><tbody></tbody></table>
+
+<h2>Add repo</h2>
+<form id="repo-form">
+  <input name="github_repo" placeholder="owner/repo" required>
+  <input name="token_secret" placeholder="secret manager secret name" required>
+  <input name="dag_path_template" placeholder="dags/{dag_id}.py">
+  <label><input type="checkbox" name="set_default"> default</label>
+  <button type="submit">Add</button>
+</form>
+
+<h2>Registered repos</h2>
+<pre id="repos"></pre>
+
+<script>
+async function loadRuns() {
+  const runs = await (await fetch('/api/runs')).json();
+  const body = document.querySelector('#runs tbody');
+  body.innerHTML = '';
+  for (const r of runs) {
+    const pr = r.pr_url ? `<a href="${r.pr_url}" target="_blank">#${r.pr_number}</a>` : '';
+    body.innerHTML += `<tr><td>${r.dag_id||''}</td><td>${r.task_id||''}</td><td>${r.run_id||''}</td>`
+      + `<td>${r.status||''}</td><td>${r.confidence_score ?? ''}</td><td>${pr}</td></tr>`;
+  }
+}
+
+async function loadWeights() {
+  const cfg = await (await fetch('/api/weights')).json();
+  const body = document.querySelector('#weights tbody');
+  body.innerHTML = '';
+  const rows = [...Object.entries(cfg.weights), ['penalty', cfg.penalty], ['threshold', cfg.threshold]];
+  for (const [name, value] of rows) {
+    body.innerHTML += `<tr><td>${name}</td>`
+      + `<td><input data-name="${name}" type="number" step="0.01" value="${value}"></td>`
+      + `<td><button data-save="${name}">Save</button></td></tr>`;
+  }
+  body.querySelectorAll('button[data-save]').forEach(btn => {
+    btn.onclick = async () => {
+      const name = btn.dataset.save;
+      const input = body.querySelector(`input[data-name="${name}"]`);
+      const value = parseFloat(input.value);
+      const cfg = await (await fetch('/api/weights')).json();
+      if (name === 'penalty' || name === 'threshold') cfg[name] = value;
+      else cfg.weights[name] = value;
+      await fetch('/api/weights', { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg) });
+      loadWeights();
+    };
+  });
+}
+
+async function loadRepos() {
+  document.querySelector('#repos').textContent = JSON.stringify(await (await fetch('/api/repos')).json(), null, 2);
+}
+
+document.querySelector('#repo-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const form = new FormData(e.target);
+  await fetch('/api/repos', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      github_repo: form.get('github_repo'), token_secret: form.get('token_secret'),
+      dag_path_template: form.get('dag_path_template') || undefined,
+      set_default: form.get('set_default') === 'on',
+    }),
+  });
+  e.target.reset();
+  loadRepos();
+};
+
+loadRuns(); loadWeights(); loadRepos();
+setInterval(loadRuns, 10000);
+</script>
+</body>
+</html>
