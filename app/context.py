@@ -50,6 +50,9 @@ def fetch_task_logs(filter_str: str) -> str:
             if entries:
                 lines = [str(e.payload) for e in entries]
                 return "\n".join(reversed(lines))
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+                continue
             return ""
         except ResourceExhausted:
             if attempt == max_retries - 1:
