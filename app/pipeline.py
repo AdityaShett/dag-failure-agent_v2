@@ -55,15 +55,17 @@ def process_failure(dag_id: str, task_id: str, run_id: str, try_number: int = 1)
     repo_info = repos_store.resolve_repo(dag_id)
     github_repo, target_file = repo_info["github_repo"], repo_info["target_file"]
 
+    store.upsert_run(doc_id, {
+        "dag_id": dag_id, "task_id": task_id, "run_id": run_id,
+        "github_repo": github_repo, "status": "processing",
+    })
+
     logs = context.fetch_task_logs(
         context.build_task_log_filter(dag_id=dag_id, task_id=task_id, run_id=run_id)
     )
     source = context.fetch_dag_source(github_repo, target_file)
 
-    store.upsert_run(doc_id, {
-        "dag_id": dag_id, "task_id": task_id, "run_id": run_id,
-        "github_repo": github_repo, "status": "scoring",
-    })
+    store.upsert_run(doc_id, {"status": "scoring"})
 
     root_cause = _ask_root_cause(dag_id, task_id, logs, source)
     proposed_fix = _ask_fix(root_cause, source)
@@ -77,9 +79,18 @@ def process_failure(dag_id: str, task_id: str, run_id: str, try_number: int = 1)
         "confidence_score": result["score"],
     })
 
-    if proposed_fix.strip() == "NO_CONFIDENT_FIX" or result["score"] < weights["threshold"]:
-        store.upsert_run(doc_id, {"status": "gated"})
-        return {"status": "gated", "confidence_score": result["score"]}
+    refused = proposed_fix.strip() == "NO_CONFIDENT_FIX"
+    below_threshold = result["score"] < weights["threshold"]
+    if refused or below_threshold:
+        gate_reason = "model_refused" if refused else "below_threshold"
+        store.upsert_run(doc_id, {
+            "status": "gated",
+            "gate_reason": gate_reason,
+            "threshold": weights["threshold"],
+            "proposed_fix": proposed_fix,
+            "log_chars": len(logs),
+        })
+        return {"status": "gated", "gate_reason": gate_reason, "confidence_score": result["score"]}
 
     pr = github_ops.open_draft_pr(
         github_repo=github_repo, target_file=target_file, dag_id=dag_id, task_id=task_id,

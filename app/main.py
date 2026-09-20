@@ -49,7 +49,7 @@ async def failure(request: Request):
         )
     except Exception as e:
         logger.exception(f"pipeline failed: {e}")
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
     return result
 

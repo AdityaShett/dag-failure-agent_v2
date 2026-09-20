@@ -4,13 +4,14 @@ from airflow.operators.python import PythonOperator
 
 from agent_failure_callback import notify_dag_failure_agent
 
-REGION_ORDER = ["west", "east", "central"]
+REGION_ORDER = ["west", "east", "central", "other"]
 
 
 def group_orders_by_region(orders):
     grouped = {region: [] for region in REGION_ORDER}
     for order in orders:
-        grouped[order["region"]].append(order)
+        region = order["region"] if order["region"] in grouped else "other"
+        grouped[region].append(order)
     return grouped
 
 
