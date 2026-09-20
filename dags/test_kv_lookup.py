@@ -8,9 +8,8 @@ from agent_failure_callback import notify_dag_failure_agent
 def look_up_service_tier():
     config = {"environment": "prod", "region": "us-central1"}
     print("looking up tier for", config["environment"])
-    tier = config["service_teir"]
+    tier = config["service_tier"]
     print("tier:", tier)
-
 
 with DAG(
     dag_id="test_kv_lookup",
