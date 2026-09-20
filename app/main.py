@@ -112,6 +112,10 @@ async def api_update_weights(request: Request):
 async def api_repos():
     return repos_store.load_repos()
 
+@app.delete("/api/repos/{github_repo:path}")
+async def api_delete_repo(github_repo: str):
+    return repos_store.delete_repo(github_repo)
+
 
 @app.post("/api/repos")
 async def api_add_repo(request: Request):

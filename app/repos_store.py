@@ -45,6 +45,13 @@ def add_repo(github_repo: str, token_secret: str, dag_path_template: str, set_de
     save_repos(data)
     return data
 
+def delete_repo(github_repo: str):
+    data = load_repos(force=True)
+    data.pop(github_repo, None)
+    if data.get("default") == github_repo:
+        data.pop("default", None)
+    save_repos(data)
+    return data
 
 def resolve_repo(dag_id: str) -> dict:
     data = load_repos()

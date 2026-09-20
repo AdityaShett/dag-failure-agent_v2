@@ -23,8 +23,8 @@ button.danger:disabled { background: #ccc; cursor: default; }
 
 <h2>Runs</h2>
 <div class="toolbar">
-  <button id="delete-selected" class="danger" disabled>Delete selected</button>
-  <span id="selected-count"></span>
+  <button id="delete-runs" class="danger" disabled>Delete selected</button>
+  <span id="runs-selected-count"></span>
 </div>
 <table id="runs"><thead>
 <tr><th></th><th>dag_id</th><th>task_id</th><th>run_id</th><th>status</th><th>confidence</th><th>PR</th></tr>
@@ -45,8 +45,12 @@ button.danger:disabled { background: #ccc; cursor: default; }
 </form>
 
 <h2>Registered repos</h2>
+<div class="toolbar">
+  <button id="delete-repos" class="danger" disabled>Delete selected</button>
+  <span id="repos-selected-count"></span>
+</div>
 <table id="repos"><thead>
-<tr><th>repo</th><th>token secret</th><th>path template</th><th>default</th></tr>
+<tr><th></th><th>repo</th><th>token secret</th><th>path template</th><th>default</th></tr>
 </thead><tbody></tbody></table>
 
 <script>
@@ -56,26 +60,22 @@ async function loadRuns() {
   body.innerHTML = '';
   for (const r of runs) {
     const pr = r.pr_url ? `<a href="${r.pr_url}" target="_blank">#${r.pr_number}</a>` : '';
-    body.innerHTML += `<tr><td><input type="checkbox" class="row-select" data-id="${r.id}"></td>`
+    body.innerHTML += `<tr><td><input type="checkbox" class="run-select" data-id="${r.id}"></td>`
       + `<td>${r.dag_id||''}</td><td>${r.task_id||''}</td><td>${r.run_id||''}</td>`
       + `<td>${r.status||''}</td><td>${r.confidence_score ?? ''}</td><td>${pr}</td></tr>`;
   }
-  updateDeleteButton();
-  document.querySelectorAll('.row-select').forEach(cb => {
-    cb.onchange = updateDeleteButton;
-  });
+  document.querySelectorAll('.run-select').forEach(cb => { cb.onchange = updateRunsButton; });
+  updateRunsButton();
 }
 
-function updateDeleteButton() {
-  const checked = document.querySelectorAll('.row-select:checked');
-  const btn = document.querySelector('#delete-selected');
-  const count = document.querySelector('#selected-count');
-  btn.disabled = checked.length === 0;
-  count.textContent = checked.length ? `${checked.length} selected` : '';
+function updateRunsButton() {
+  const checked = document.querySelectorAll('.run-select:checked');
+  document.querySelector('#delete-runs').disabled = checked.length === 0;
+  document.querySelector('#runs-selected-count').textContent = checked.length ? `${checked.length} selected` : '';
 }
 
-document.querySelector('#delete-selected').onclick = async () => {
-  const checked = [...document.querySelectorAll('.row-select:checked')];
+document.querySelector('#delete-runs').onclick = async () => {
+  const checked = [...document.querySelectorAll('.run-select:checked')];
   if (!checked.length) return;
   if (!confirm(`Delete ${checked.length} run(s)? This cannot be undone.`)) return;
   await Promise.all(checked.map(cb => fetch(`/api/runs/${cb.dataset.id}`, { method: 'DELETE' })));
@@ -114,10 +114,27 @@ async function loadRepos() {
   for (const [repo, cfg] of Object.entries(data)) {
     if (repo === 'default' || repo === 'dag_overrides') continue;
     const isDefault = repo === defaultRepo ? 'yes' : '';
-    body.innerHTML += `<tr><td>${repo}</td><td>${cfg.token_secret||''}</td>`
+    body.innerHTML += `<tr><td><input type="checkbox" class="repo-select" data-repo="${repo}"></td>`
+      + `<td>${repo}</td><td>${cfg.token_secret||''}</td>`
       + `<td>${cfg.dag_path_template||''}</td><td>${isDefault}</td></tr>`;
   }
+  document.querySelectorAll('.repo-select').forEach(cb => { cb.onchange = updateReposButton; });
+  updateReposButton();
 }
+
+function updateReposButton() {
+  const checked = document.querySelectorAll('.repo-select:checked');
+  document.querySelector('#delete-repos').disabled = checked.length === 0;
+  document.querySelector('#repos-selected-count').textContent = checked.length ? `${checked.length} selected` : '';
+}
+
+document.querySelector('#delete-repos').onclick = async () => {
+  const checked = [...document.querySelectorAll('.repo-select:checked')];
+  if (!checked.length) return;
+  if (!confirm(`Remove ${checked.length} repo(s) from the registry? This cannot be undone.`)) return;
+  await Promise.all(checked.map(cb => fetch(`/api/repos/${encodeURIComponent(cb.dataset.repo)}`, { method: 'DELETE' })));
+  loadRepos();
+};
 
 document.querySelector('#repo-form').onsubmit = async (e) => {
   e.preventDefault();
