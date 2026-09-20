@@ -1,8 +1,10 @@
 steps:
   - name: gcr.io/cloud-builders/docker
     args: ["build", "-t", "gcr.io/$PROJECT_ID/dag-failure-agent", "."]
+
   - name: gcr.io/cloud-builders/docker
     args: ["push", "gcr.io/$PROJECT_ID/dag-failure-agent"]
+
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
     args:
@@ -12,6 +14,8 @@ steps:
       - --image=gcr.io/$PROJECT_ID/dag-failure-agent
       - --region=us-central1
       - --platform=managed
-      - --no-allow-unauthenticated
+      - --allow-unauthenticated
+      - --set-env-vars=GCP_PROJECT=$PROJECT_ID,GCP_LOCATION=us-central1,GEMINI_MODEL_NAME=gemini-2.5-flash,REPOS_CONFIG_BUCKET=$PROJECT_ID-repos-config,REPOS_CONFIG_BLOB=repos.json,WEIGHTS_SEED_PATH=config/weights.json,AGENT_FAILURE_TOPIC=dagfailures
+
 images:
   - gcr.io/$PROJECT_ID/dag-failure-agent
