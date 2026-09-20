@@ -87,6 +87,10 @@ async def github_webhook(request: Request):
 async def api_runs():
     return store.list_runs()
 
+@app.delete("/api/runs/{doc_id}")
+async def api_delete_run(doc_id: str):
+    store.delete_run(doc_id)
+    return {"status": "deleted", "id": doc_id}
 
 @app.get("/api/weights")
 async def api_weights():

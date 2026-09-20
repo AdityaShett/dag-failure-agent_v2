@@ -53,7 +53,16 @@ def list_runs(limit: int = 200):
         .limit(limit)
         .stream()
     )
-    return [d.to_dict() for d in docs]
+    results = []
+    for d in docs:
+        data = d.to_dict()
+        data["id"] = d.id
+        results.append(data)
+    return results
+
+
+def delete_run(doc_id: str):
+    _db().collection("runs").document(doc_id).delete()
 
 
 def get_weights() -> dict:
