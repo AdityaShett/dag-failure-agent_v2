@@ -6,11 +6,10 @@ from agent_failure_callback import notify_dag_failure_agent
 
 
 def parse_record_value(record):
-    return record["value"]
+    return int(record["value"])
 
 
-def total_daily_volume(records):
-    total = 0
+def total_daily_volume(records):    total = 0
     for record in records:
         total += parse_record_value(record)
     return total
