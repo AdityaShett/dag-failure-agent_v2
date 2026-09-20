@@ -1,13 +1,13 @@
 import json
 import os
-
 from google.cloud import pubsub_v1
 
-_PROJECT = os.environ.get("GCP_PROJECT")
+_PROJECT = (
+    os.environ.get("DAG_AGENT_GCP_PROJECT")
+    or os.environ.get("GCP_PROJECT")
+    or "dag-failure-agent-v2"
+)
 _TOPIC = os.environ.get("AGENT_FAILURE_TOPIC", "dagfailures")
-
-_publisher = pubsub_v1.PublisherClient()
-_topic_path = _publisher.topic_path(_PROJECT, _TOPIC)
 
 
 def notify_dag_failure_agent(context):
@@ -22,7 +22,9 @@ def notify_dag_failure_agent(context):
     }
 
     try:
-        future = _publisher.publish(_topic_path, json.dumps(payload).encode("utf-8"))
+        publisher = pubsub_v1.PublisherClient()
+        topic_path = publisher.topic_path(_PROJECT, _TOPIC)
+        future = publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
         future.result(timeout=10)
     except Exception as e:
         print(f"WARNING: could not publish failure event: {e!r}")
