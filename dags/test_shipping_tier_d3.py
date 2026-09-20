@@ -12,9 +12,10 @@ def classify_shipment(weight_kg, is_international):
         category = "international_parcel"
     elif weight_kg > 20:
         category = "heavy_parcel"
+    else:
+        category = "standard_parcel"
 
     return category
-
 
 def build_shipping_label(weight_kg, is_international):
     category = classify_shipment(weight_kg, is_international)
