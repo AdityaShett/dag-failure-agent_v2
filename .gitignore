@@ -4,3 +4,4 @@ MASTER.md
 *.env
 dashboard-sa-key.json
 github-webhook-secret.txt
+.venv/
