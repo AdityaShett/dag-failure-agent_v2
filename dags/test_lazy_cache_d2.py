@@ -42,3 +42,7 @@ with DAG(
         task_id="run_sync_job",
         python_callable=run_sync_job,
     )
+
+
+# agent fix could not be applied automatically
+# UnidiffParseError: Hunk is longer than expected
