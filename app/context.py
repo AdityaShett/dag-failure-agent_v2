@@ -23,14 +23,25 @@ def build_task_log_filter(dag_id: str, task_id: str, run_id: str = None,
     end = failure_time + timedelta(minutes=lookback_minutes)
 
     parts = [
+        'resource.type="cloud_composer_environment"',
         f'timestamp >= "{start.astimezone(timezone.utc).isoformat()}"',
         f'timestamp <= "{end.astimezone(timezone.utc).isoformat()}"',
     ]
-    if dag_id:
+    if dag_id and task_id:
+        parts.append(f'(textPayload:"{dag_id}" OR textPayload:"{task_id}")')
+    elif dag_id:
         parts.append(f'textPayload:"{dag_id}"')
-    if task_id:
+    elif task_id:
         parts.append(f'textPayload:"{task_id}"')
     return " AND ".join(parts)
+
+
+def _payload_to_text(payload) -> str:
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        return payload.get("message") or payload.get("textPayload") or str(payload)
+    return str(payload)
 
 
 def fetch_task_logs(filter_str: str) -> str:
@@ -48,7 +59,7 @@ def fetch_task_logs(filter_str: str) -> str:
                 )
             )
             if entries:
-                lines = [str(e.payload) for e in entries]
+                lines = [_payload_to_text(e.payload) for e in entries]
                 return "\n".join(reversed(lines))
             if attempt < max_retries - 1:
                 time.sleep(base_delay * (2 ** attempt))
