@@ -1,10 +1,10 @@
 import re
+import hashlib
 
 SIGNAL_NAMES = (
-    "stack_trace_present",
-    "line_number_matches_source",
-    "known_fix_pattern_match",
-    "log_completeness",
+    "stack_trace_present", "line_number_matches_source",
+    "known_fix_pattern_match", "log_completeness",
+    "failure_history",
 )
 
 _TRACEBACK_HEADER = re.compile(r"Traceback \(most recent call last\)", re.IGNORECASE)
@@ -17,6 +17,11 @@ _EXC_RE = re.compile(
 _LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|WARNING|INFO|DEBUG)\b")
 _TIMESTAMP_RE = re.compile(r"\[\d{4}-\d{2}-\d{2}[ T,]")
 _EXTERNAL_PATH_MARKERS = ("/site-packages/", "\\site-packages\\", "/dist-packages/")
+
+
+OUTCOME_VALUE = {"merged": 1.0, "opened": 0.5, "gated": 0.4, "closed": 0.0}
+MIN_HISTORY_STRENGTH = 0.5
+_STRING_LITERAL = re.compile(r"""(['"])(?:(?!\1).)*\1""")
 
 KNOWN_FIX_PATTERNS = {
     "KeyError", "FileNotFoundError", "AttributeError", "ModuleNotFoundError",
@@ -35,6 +40,15 @@ def _strip_log_prefix(line: str) -> str:
 
 def _normalize_code(code: str) -> str:
     return re.sub(r"\s+", "", code or "")
+
+def error_fingerprint(parsed: dict) -> str:
+    exc = (parsed.get("exception_type") or "").rsplit(".", 1)[-1]
+    code = (parsed.get("app_frame") or {}).get("code", "")
+    code = re.sub(r"\d+", "N", _STRING_LITERAL.sub("S", code))
+    code = _normalize_code(code)
+    if not exc or not code:
+        return ""
+    return f"{exc}:{hashlib.sha1(code.encode()).hexdigest()[:12]}"
 
 
 def parse_log(task_logs: str) -> dict:
@@ -149,13 +163,25 @@ def signal_log_completeness(parsed: dict, task_logs: str, dag_id: str = "", task
     return round(sum(1 for c in checks if c) / len(checks), 4)
 
 
-def extract_signals(task_logs: str, dag_source: str, dag_id: str = "", task_id: str = "") -> dict:
+def signal_failure_history(history):
+    if not history:
+        return None
+    total = sum(h["strength"] for h in history)
+    if total < MIN_HISTORY_STRENGTH:
+        return None                      # inactive
+    weighted = sum(h["strength"] * OUTCOME_VALUE[h["status"]] for h in history)
+    return round((weighted + 0.5) / (total + 1.0), 4) 
+
+
+def extract_signals(task_logs: str, dag_source: str, dag_id: str = "", task_id: str = "",
+                     history: list = None) -> dict:
     parsed = parse_log(task_logs)
     return {
         "stack_trace_present": signal_stack_trace_present(parsed),
         "line_number_matches_source": signal_line_number_matches_source(parsed, dag_source),
         "known_fix_pattern_match": signal_known_fix_pattern_match(parsed),
         "log_completeness": signal_log_completeness(parsed, task_logs, dag_id, task_id),
+        "failure_history": signal_failure_history(history),
     }
 
 
@@ -165,7 +191,11 @@ def score(signals: dict, weights: dict) -> dict:
     contributions = {}
     for name in SIGNAL_NAMES:
         w = float(weights.get(name, 0.0))
-        s = max(0.0, min(1.0, float(signals.get(name, 0.0))))
+        raw = signals.get(name)
+        if raw is None:                      # inactive: out of numer AND denom
+            contributions[name] = 0.0
+            continue
+        s = max(0.0, min(1.0, float(raw)))
         contributions[name] = w * s
         numer += w * s
         denom += w

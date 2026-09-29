@@ -78,7 +78,7 @@ async def github_webhook(request: Request):
         return {"status": "no_matching_run"}
 
     store.upsert_run(doc_id, {"status": "merged" if merged else "closed"})
-    tuning.apply_outcome(run, merged=merged, proposed_fix=run.get("proposed_fix", ""))
+    tuning.apply_outcome(run, merged=merged, proposed_fix=run.get("proposed_fix", ""), doc_id=doc_id)
 
     return {"status": "recorded", "merged": merged}
 
@@ -105,7 +105,14 @@ async def api_update_weights(request: Request):
         if key in body:
             cfg[key] = body[key]
     store.save_weights(cfg)
+    if "weights" in body:
+        store.append_weight_snapshot(cfg["weights"], source="manual")
     return cfg
+
+
+@app.get("/api/weight-history")
+async def api_weight_history():
+    return store.list_weight_history()
 
 
 @app.get("/api/repos")
@@ -130,7 +137,6 @@ async def api_add_repo(request: Request):
 @app.get("/")
 async def dashboard():
     return FileResponse(os.path.join(os.path.dirname(__file__), "dashboard", "index.html"))
-
 
 @app.get("/healthz")
 async def healthz():

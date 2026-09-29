@@ -2,7 +2,7 @@ import os
 
 from google import genai
 
-from app import confidence, context, github_ops, repos_store, store
+from app import confidence, context, cost, github_ops, history, repos_store, store
 
 _GENAI_CLIENT = None
 _MODEL = os.environ.get("GEMINI_MODEL_NAME", "gemini-2.5-flash")
@@ -17,6 +17,11 @@ def _genai():
     return _GENAI_CLIENT
 
 
+def _generate(prompt: str):
+    resp = _genai().models.generate_content(model=_MODEL, contents=prompt)
+    return resp.text or "", cost.usage_from_response(resp)
+
+
 def _ask_root_cause(dag_id, task_id, logs, source):
     prompt = (
         "You are an Airflow reliability engineer. Find the exact root cause of this "
@@ -25,8 +30,7 @@ def _ask_root_cause(dag_id, task_id, logs, source):
         f"DAG: {dag_id} | Task: {task_id}\n\n--- LOGS ---\n{logs[-4000:]}\n\n"
         f"--- CODE ---\n{source}"
     )
-    resp = _genai().models.generate_content(model=_MODEL, contents=prompt)
-    return resp.text or ""
+    return _generate(prompt)
 
 
 def _ask_fix(root_cause, source):
@@ -40,11 +44,9 @@ def _ask_fix(root_cause, source):
         "NO_CONFIDENT_FIX>\n\n"
         f"Root cause:\n{root_cause}\n\nCurrent code:\n{source}"
     )
-    resp = _genai().models.generate_content(model=_MODEL, contents=prompt)
-    text = resp.text or ""
-    if "DIFF:" in text:
-        return text.split("DIFF:", 1)[1].strip()
-    return "NO_CONFIDENT_FIX"
+    text, usage = _generate(prompt)
+    fix = text.split("DIFF:", 1)[1].strip() if "DIFF:" in text else "NO_CONFIDENT_FIX"
+    return fix, usage
 
 
 def process_failure(dag_id: str, task_id: str, run_id: str, try_number: int = 1) -> dict:
@@ -67,16 +69,25 @@ def process_failure(dag_id: str, task_id: str, run_id: str, try_number: int = 1)
 
     store.upsert_run(doc_id, {"status": "scoring"})
 
-    root_cause = _ask_root_cause(dag_id, task_id, logs, source)
-    proposed_fix = _ask_fix(root_cause, source)
+    root_cause, rc_usage = _ask_root_cause(dag_id, task_id, logs, source)
+    proposed_fix, fix_usage = _ask_fix(root_cause, source)
+    run_cost = cost.build_cost_record(_MODEL, {"root_cause": rc_usage, "fix": fix_usage})
 
-    signals = confidence.extract_signals(logs, source, dag_id, task_id)
+    parsed = confidence.parse_log(logs)
+    exc = (parsed["exception_type"] or "").rsplit(".", 1)[-1]
+    fingerprint = confidence.error_fingerprint(parsed)
+    related = history.find_related_failures(doc_id, dag_id, exc, fingerprint)
+
+    signals = confidence.extract_signals(logs, source, dag_id, task_id, history=related)
     weights = store.get_weights()
     result = confidence.score(signals, weights["weights"])
 
     store.upsert_run(doc_id, {
         "signals": signals, "contributions": result["contributions"],
         "confidence_score": result["score"],
+        "cost": run_cost,
+        "exception_type": exc, "error_fingerprint": fingerprint,
+        "history_matches": related,
     })
 
     refused = proposed_fix.strip() == "NO_CONFIDENT_FIX"

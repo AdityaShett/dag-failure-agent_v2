@@ -4,7 +4,7 @@ SMALL_DIFF_LINES = 3
 WEIGHT_FLOOR = 0.01
 
 
-def apply_outcome(run: dict, merged: bool, proposed_fix: str = ""):
+def apply_outcome(run: dict, merged: bool, proposed_fix: str = "", doc_id: str = None):
     shares = run.get("confidence_shares")
     confidence_score = run.get("confidence_score")
     if not shares or confidence_score is None:
@@ -29,3 +29,4 @@ def apply_outcome(run: dict, merged: bool, proposed_fix: str = ""):
 
     cfg["weights"] = weights
     store.save_weights(cfg)
+    store.append_weight_snapshot(weights, source="outcome", run_doc_id=doc_id, merged=merged)
