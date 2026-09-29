@@ -18,21 +18,16 @@ def _parse_failure_time_from_run_id(run_id: str) -> datetime:
 
 def build_task_log_filter(dag_id: str, task_id: str, run_id: str = None,
                            lookback_minutes: int = 120) -> str:
-    failure_time = _parse_failure_time_from_run_id(run_id or "")
-    start = failure_time - timedelta(minutes=lookback_minutes)
-    end = failure_time + timedelta(minutes=lookback_minutes)
-
     parts = [
         'resource.type="cloud_composer_environment"',
-        f'timestamp >= "{start.astimezone(timezone.utc).isoformat()}"',
-        f'timestamp <= "{end.astimezone(timezone.utc).isoformat()}"',
+        'logName:"logs/airflow-worker"',
     ]
-    if dag_id and task_id:
-        parts.append(f'(textPayload:"{dag_id}" OR textPayload:"{task_id}")')
-    elif dag_id:
-        parts.append(f'textPayload:"{dag_id}"')
-    elif task_id:
-        parts.append(f'textPayload:"{task_id}"')
+    if dag_id:
+        parts.append(f'labels."workflow"="{dag_id}"')
+    if task_id:
+        parts.append(f'labels."task-id"="{task_id}"')
+    if run_id:
+        parts.append(f'labels."run-id"="{run_id}"')
     return " AND ".join(parts)
 
 
