@@ -6,8 +6,7 @@ from agent_failure_callback import notify_dag_failure_agent
 
 
 def sync_inventory_item(item):
-    return item["sku"]
-
+    return item.get("sku")
 
 def run_inventory_sync():
     items = [{"sku": "A1", "qty": 5}, {"qty": 3}]  # second item is missing "sku" on purpose
