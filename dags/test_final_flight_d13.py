@@ -27,3 +27,7 @@ with DAG(
         task_id="run_final_flight",
         python_callable=run_final_flight,
     )
+
+
+# agent fix could not be applied automatically
+# UnidiffParseError: Hunk is shorter than expected
