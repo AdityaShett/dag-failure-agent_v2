@@ -23,3 +23,7 @@ with DAG(
         task_id="run_inventory_retry",
         python_callable=run_inventory_retry,
     )
+
+
+# agent fix could not be applied automatically
+# UnidiffParseError: Hunk is shorter than expected
