@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>dag-failure-agent</title>
 <style>
 body { font-family: sans-serif; font-size: 14px; margin: 24px; }
@@ -17,11 +18,36 @@ h2 { margin-top: 40px; }
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
 button.danger { background: #c0392b; color: white; border: none; padding: 6px 12px; cursor: pointer; }
 button.danger:disabled { background: #ccc; cursor: default; }
+
+/* navigation + page sections */
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid #ccc; margin-bottom: 8px; }
+.tab { background: #f0f0f0; border: 1px solid #ccc; border-bottom: none; padding: 8px 16px; cursor: pointer; font: inherit; }
+.tab.active { background: #fff; font-weight: bold; position: relative; top: 1px; }
+.page { display: none; }
+.page.active { display: block; }
+.page > h2:first-child { margin-top: 24px; }
+
+/* analytics layout */
+#cost-kpis { background: #f0f0f0; border: 1px solid #ccc; padding: 10px 14px; margin-bottom: 20px; }
+.chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; }
+.chart-card { border: 1px solid #ccc; padding: 12px 16px 16px; }
+.chart-card.wide { grid-column: 1 / -1; }
+.chart-card h3 { margin: 0 0 4px; font-size: 15px; }
+.chart-card p { margin: 0 0 10px; color: #666; font-size: 12px; }
+.chart-box { position: relative; height: 300px; }
 </style>
 </head>
 <body>
 
 <h1>DAG Failure Agent</h1>
+
+<nav class="tabs">
+  <button class="tab active" data-page="dashboard">Dashboard</button>
+  <button class="tab" data-page="analytics">Analytics</button>
+</nav>
+
+<!-- ===================== DASHBOARD ===================== -->
+<section id="dashboard" class="page active">
 
 <h2>Runs</h2>
 <div class="toolbar">
@@ -29,7 +55,7 @@ button.danger:disabled { background: #ccc; cursor: default; }
   <span id="runs-selected-count"></span>
 </div>
 <table id="runs"><thead>
-<tr><th></th><th>dag_id</th><th>task_id</th><th>run_id</th><th>status</th><th>confidence</th><th>PR</th></tr>
+<tr><th></th><th>timestamp</th><th>dag_id</th><th>task_id</th><th>run_id</th><th>status</th><th>confidence</th><th>cost (USD)</th><th>PR</th></tr>
 </thead><tbody></tbody></table>
 
 <h2>Weights</h2>
@@ -55,6 +81,32 @@ button.danger:disabled { background: #ccc; cursor: default; }
 <tr><th></th><th>repo</th><th>token secret</th><th>path template</th><th>default</th></tr>
 </thead><tbody></tbody></table>
 
+</section>
+
+<!-- ===================== ANALYTICS ===================== -->
+<section id="analytics" class="page">
+  <h2>Analytics</h2>
+  <div id="cost-kpis">Loading…</div>
+
+  <div class="chart-grid">
+    <div class="chart-card wide">
+      <h3>Cost per run</h3>
+      <p>Total, input and output cost in USD for each run.</p>
+      <div class="chart-box"><canvas id="costChart"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3>Confidence by outcome</h3>
+      <p>Green = merged, red = closed, blue = open, grey = gated. Dashed line is the threshold.</p>
+      <div class="chart-box"><canvas id="confChart"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <h3>Weights over time</h3>
+      <p>How each scoring weight has changed.</p>
+      <div class="chart-box"><canvas id="weightChart"></canvas></div>
+    </div>
+  </div>
+</section>
+
 <script>
 async function loadRuns() {
   const runs = await (await fetch('/api/runs')).json();
@@ -62,9 +114,11 @@ async function loadRuns() {
   body.innerHTML = '';
   for (const r of runs) {
     const pr = r.pr_url ? `<a href="${r.pr_url}" target="_blank">#${r.pr_number}</a>` : '';
+    const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '';
+    const c = r.cost && r.cost.total_cost_usd != null ? '$' + r.cost.total_cost_usd.toFixed(4) : '';
     body.innerHTML += `<tr><td><input type="checkbox" class="run-select" data-id="${r.id}"></td>`
-      + `<td>${r.dag_id||''}</td><td>${r.task_id||''}</td><td>${r.run_id||''}</td>`
-      + `<td>${r.status||''}</td><td>${r.confidence_score ?? ''}</td><td>${pr}</td></tr>`;
+      + `<td>${ts}</td><td>${r.dag_id||''}</td><td>${r.task_id||''}</td><td>${r.run_id||''}</td>`
+      + `<td>${r.status||''}</td><td>${r.confidence_score ?? ''}</td><td>${c}</td><td>${pr}</td></tr>`;
   }
   document.querySelectorAll('.run-select').forEach(cb => { cb.onchange = updateRunsButton; });
   updateRunsButton();
@@ -157,18 +211,16 @@ loadRuns(); loadWeights(); loadRepos();
 setInterval(loadRuns, 10000);
 </script>
 
-<section id="analytics">
-  <div id="cost-kpis"></div>
-  <canvas id="costChart"></canvas>
-  <canvas id="confChart"></canvas>
-  <canvas id="weightChart"></canvas>
-</section>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
 <script>
 const usd = n => "$" + (n ?? 0).toFixed(4);
 const short = ts => (ts || "").slice(5, 16).replace("T", " ");
 const STATUS_COLOR = {merged:"#16a34a", closed:"#dc2626", opened:"#2563eb", gated:"#9ca3af"};
-const mk = (id, cfg) => new Chart(document.getElementById(id), cfg);
+const mk = (id, cfg) => {
+  Chart.getChart(id)?.destroy();                     // allow re-render on each visit
+  cfg.options = {responsive: true, maintainAspectRatio: false, ...(cfg.options || {})};
+  return new Chart(document.getElementById(id), cfg);
+};
 
 async function renderAnalytics() {
   const [runs, wh, cfg] = await Promise.all(
@@ -206,7 +258,16 @@ async function renderAnalytics() {
       ({label: n, data: wh.map(s => s.weights[n] ?? null), spanGaps: true})),
   }});
 }
-renderAnalytics();
+
+// tab switching (charts render when the Analytics tab is opened, so they size correctly)
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === name));
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.page === name));
+  if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+  if (name === 'analytics') renderAnalytics();
+}
+document.querySelectorAll('.tab').forEach(t => { t.onclick = () => showPage(t.dataset.page); });
+if (location.hash === '#analytics') showPage('analytics');
 </script>
 
 </body>
