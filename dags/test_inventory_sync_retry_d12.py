@@ -8,11 +8,10 @@ from agent_failure_callback import notify_dag_failure_agent
 def run_inventory_retry():
     pending_items = [{"sku": "B7", "location": "east"}, {"location": "west"}]  # second entry missing "sku"
     for entry in pending_items:
-        print("processing", entry["sku"])
+        print("processing", entry.get("sku"))
 
 
-with DAG(
-    dag_id="test_inventory_sync_retry_d12",
+with DAG(    dag_id="test_inventory_sync_retry_d12",
     schedule=None,
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
