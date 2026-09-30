@@ -28,7 +28,7 @@ def apply_outcome(run: dict, merged: bool, proposed_fix: str = "", doc_id: str =
             if merged and not small:
                 change = step * share
             elif merged and small:
-                change = -step * share
+                change = 0.0
             else:
                 change = -step * confidence_score * share
             new = max(WEIGHT_FLOOR, weights[name] + change)

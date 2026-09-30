@@ -1,10 +1,11 @@
 import os
 import re
+import time
 
 from google import genai
 from google.genai import types
 
-from app import confidence, context, cost, github_ops, history, repos_store, store
+from app import confidence, context, cost, diff_utils, github_ops, history, repos_store, store
 
 _GENAI_CLIENT = None
 _MODEL = os.environ.get("GEMINI_MODEL_NAME", "gemini-2.5-flash")
@@ -12,10 +13,12 @@ _PROJECT = os.environ.get("GCP_PROJECT")
 _LOCATION = os.environ.get("GCP_LOCATION", "global")
 
 NO_FIX = "NO_CONFIDENT_FIX"
-FIX_ATTEMPTS = 2              # 2nd attempt only happens when the failing line is verified in source
-MAX_PROCESS_ATTEMPTS = 3      # Pub/Sub redeliveries of a run that errored mid-pipeline
-LINE_VERIFIED_MIN = 0.6       # line_number_matches_source >= this => failing code exists in source
+FIX_ATTEMPTS = 2              
+MAX_PROCESS_ATTEMPTS = 3      
+LINE_VERIFIED_MIN = 0.6      
 _ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0}
+STALE_AFTER_SECONDS = 600
+IN_PROGRESS = ("processing", "scoring", "generating")
 
 
 def _genai():
@@ -60,7 +63,7 @@ def _parse_fix(text: str) -> str:
     if not body or NO_FIX in body:
         return NO_FIX
     if not re.search(r"^(diff --git|--- |\+\+\+ |@@)", body, re.M):
-        return NO_FIX                    
+        return NO_FIX
     return body
 
 
@@ -76,16 +79,20 @@ def _ask_root_cause(dag_id, task_id, logs, source, evidence=""):
     return _generate(prompt)
 
 
-def _fix_prompt(root_cause, source, evidence, insist):
-    if insist:
+def _fix_prompt(root_cause, source, evidence, insist, line_verified=False):
+    if insist and line_verified:
         gate = ("The failing line has been mechanically verified to exist in the current "
                 "source, so the bug IS present. Do not answer NO_CONFIDENT_FIX unless a safe "
                 "fix is impossible without changing other files.\n\n")
+    elif insist:
+        gate = ("The confidence checks on this failure passed. Re-read the code carefully. "
+                "If the bug is present, propose the smallest safe diff. Answer NO_CONFIDENT_FIX "
+                "only if you cannot produce an exact diff against the code shown.\n\n")
     else:
         gate = ("Before proposing anything, check whether the root cause actually matches the "
                 "code shown below. If the described bug is not present in the current source, "
                 "or you're not certain the exact lines you'd change still look this way, do NOT "
-                "guess a diff — respond with NO_CONFIDENT_FIX instead.\n\n")
+                "guess a diff, respond with NO_CONFIDENT_FIX instead.\n\n")
     return (
         "Propose the smallest possible safe fix, as a git diff only.\n\n" + gate
         + "Respond in EXACTLY this format, nothing else:\nDIFF:\n<the git diff, or NO_CONFIDENT_FIX>\n\n"
@@ -94,13 +101,13 @@ def _fix_prompt(root_cause, source, evidence, insist):
     )
 
 
-def _ask_fix(root_cause, source, evidence="", line_verified=False):
+def _ask_fix(root_cause, source, evidence="", line_verified=False, allow_retry=False):
     total, raw, fix, attempts = dict(_ZERO_USAGE), "", NO_FIX, 0
     for attempt in range(FIX_ATTEMPTS):
         insist = attempt > 0
-        if insist and not line_verified:
+        if insist and not (line_verified or allow_retry):
             break                          # nothing new to tell the model; a retry would be identical
-        raw, usage = _generate(_fix_prompt(root_cause, source, evidence, insist))
+        raw, usage = _generate(_fix_prompt(root_cause, source, evidence, insist, line_verified))
         attempts += 1
         for k in total:
             total[k] += usage.get(k, 0)
@@ -115,8 +122,14 @@ def _ask_fix(root_cause, source, evidence="", line_verified=False):
 def process_failure(dag_id: str, task_id: str, run_id: str, try_number: int = 1) -> dict:
     doc_id = store.run_id_for(run_id, task_id)
     existing = store.get_run(doc_id)
-    if existing and existing.get("status") != "error":
-        return {"status": "duplicate_skipped"}
+    if existing:
+        status = existing.get("status")
+        if status in IN_PROGRESS:
+            started = existing.get("started_at")
+            if started and time.time() - started < STALE_AFTER_SECONDS:
+                return {"status": "in_progress"}
+        elif status != "error":
+            return {"status": "duplicate_skipped"}
 
     attempts = (existing or {}).get("attempts", 0) + 1
     if attempts > MAX_PROCESS_ATTEMPTS:
@@ -126,7 +139,7 @@ def process_failure(dag_id: str, task_id: str, run_id: str, try_number: int = 1)
     github_repo, target_file = repo_info["github_repo"], repo_info["target_file"]
     store.upsert_run(doc_id, {
         "dag_id": dag_id, "task_id": task_id, "run_id": run_id,
-        "github_repo": github_repo, "status": "processing", "attempts": attempts,
+        "github_repo": github_repo, "status": "processing", "attempts": attempts, "started_at": time.time(),
     })
 
     try:
@@ -176,7 +189,8 @@ def _process(doc_id, dag_id, task_id, run_id, github_repo, target_file) -> dict:
     if source_drift:
         proposed_fix, fix_usage, fix_meta = NO_FIX, dict(_ZERO_USAGE), {"attempts": 0, "raw": ""}
     else:
-        proposed_fix, fix_usage, fix_meta = _ask_fix(root_cause, source, evidence, line_verified)
+        proposed_fix, fix_usage, fix_meta = _ask_fix(
+            root_cause, source, evidence, line_verified, result["score"] >= threshold)
     run_cost = cost.build_cost_record(_MODEL, {"root_cause": rc_usage, "fix": fix_usage})
     store.upsert_run(doc_id, {"cost": run_cost, "fix_attempts": fix_meta["attempts"]})
 
@@ -184,10 +198,10 @@ def _process(doc_id, dag_id, task_id, run_id, github_repo, target_file) -> dict:
     refused = proposed_fix == NO_FIX
     below_threshold = result["score"] < threshold
     if refused or below_threshold:
-        if below_threshold:
-            reason = "below_threshold"
-        elif source_drift:
+        if source_drift:
             reason = "source_out_of_sync"
+        elif below_threshold:
+            reason = "below_threshold"
         else:
             reason = "model_refused"
         store.upsert_run(doc_id, {
@@ -197,6 +211,15 @@ def _process(doc_id, dag_id, task_id, run_id, github_repo, target_file) -> dict:
             "fix_raw": fix_meta["raw"][:1000] if refused else "",
         })
         return {"status": "gated", "gate_reason": reason, "confidence_score": result["score"]}
+
+    try:
+        diff_utils.apply_unified_diff(source, proposed_fix)
+    except Exception:
+        store.upsert_run(doc_id, {
+            "status": "gated", "gate_reason": "diff_unparseable",
+            "refused": False, "below_threshold": False, "proposed_fix": proposed_fix,
+        })
+        return {"status": "gated", "gate_reason": "diff_unparseable", "confidence_score": result["score"]}
 
     pr = github_ops.open_draft_pr(
         github_repo=github_repo, target_file=target_file, dag_id=dag_id, task_id=task_id,

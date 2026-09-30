@@ -25,6 +25,6 @@ def notify_dag_failure_agent(context):
         publisher = pubsub_v1.PublisherClient()
         topic_path = publisher.topic_path(_PROJECT, _TOPIC)
         future = publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
-        future.result(timeout=10)
+        future.result(timeout=30)
     except Exception as e:
         print(f"WARNING: could not publish failure event: {e!r}")

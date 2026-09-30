@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -35,9 +36,10 @@ def _webhook_secret_value() -> str:
 def _signature_ok(body: bytes, signature: str) -> bool:
     """Check the HMAC; on mismatch drop the cached secret and retry once (handles secret rotation)."""
     global _webhook_secret
+    sig_bytes = (signature or "").encode("utf-8")
     for _ in range(2):
         expected = "sha256=" + hmac.new(_webhook_secret_value().encode(), body, hashlib.sha256).hexdigest()
-        if hmac.compare_digest(expected, signature):
+        if hmac.compare_digest(expected.encode("utf-8"), sig_bytes):
             return True
         _webhook_secret = None
     return False
@@ -46,22 +48,26 @@ def _signature_ok(body: bytes, signature: str) -> bool:
 @app.post("/failure")
 async def failure(request: Request):
     envelope = await request.json()
-    message = envelope.get("message", {})
+    message = envelope.get("message") or {}
     try:
-        payload = json.loads(base64.b64decode(message.get("data", "")).decode("utf-8"))
+        payload = json.loads(base64.b64decode(message["data"]).decode("utf-8"))
     except Exception as e:
-        logger.error(f"bad pubsub payload: {e}")
-        return {"status": "error", "message": str(e)}
+        # bad message: return 200 so Pub/Sub doesn't redeliver it forever
+        logger.warning("failure: undecodable Pub/Sub message: %s", e)
+        return {"status": "bad_message"}
 
     try:
-        result = pipeline.process_failure(
-            dag_id=payload.get("dag_id"), task_id=payload.get("task_id"),
-            run_id=payload.get("run_id"), try_number=payload.get("try_number", 1),
+        result = await asyncio.to_thread(
+            pipeline.process_failure,
+            payload.get("dag_id"), payload.get("task_id"),
+            payload.get("run_id"), payload.get("try_number", 1),
         )
     except Exception as e:
         logger.exception(f"pipeline failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+    if result.get("status") == "in_progress":
+        raise HTTPException(status_code=503, detail="run in progress")
     return result
 
 
@@ -109,10 +115,12 @@ async def api_reconcile():
 async def api_runs():
     return store.list_runs()
 
+
 @app.delete("/api/runs/{doc_id}")
 async def api_delete_run(doc_id: str):
     store.delete_run(doc_id)
     return {"status": "deleted", "id": doc_id}
+
 
 @app.get("/api/weights")
 async def api_weights():
@@ -141,6 +149,7 @@ async def api_weight_history():
 async def api_repos():
     return repos_store.load_repos()
 
+
 @app.delete("/api/repos/{github_repo:path}")
 async def api_delete_repo(github_repo: str):
     return repos_store.delete_repo(github_repo)
@@ -159,6 +168,7 @@ async def api_add_repo(request: Request):
 @app.get("/")
 async def dashboard():
     return FileResponse(os.path.join(os.path.dirname(__file__), "dashboard", "index.html"))
+
 
 @app.get("/healthz")
 async def healthz():
