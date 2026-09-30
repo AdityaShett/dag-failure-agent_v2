@@ -9,8 +9,10 @@ table { border-collapse: collapse; width: 100%; margin-bottom: 32px; }
 th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: left; }
 th { background: #f0f0f0; }
 input { width: 90px; }
+input[type="checkbox"] { width: auto; }
 form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 32px; }
 form input { width: 180px; }
+form input[type="checkbox"] { width: auto; }
 h2 { margin-top: 40px; }
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
 button.danger { background: #c0392b; color: white; border: none; padding: 6px 12px; cursor: pointer; }
@@ -154,5 +156,58 @@ document.querySelector('#repo-form').onsubmit = async (e) => {
 loadRuns(); loadWeights(); loadRepos();
 setInterval(loadRuns, 10000);
 </script>
+
+<section id="analytics">
+  <div id="cost-kpis"></div>
+  <canvas id="costChart"></canvas>
+  <canvas id="confChart"></canvas>
+  <canvas id="weightChart"></canvas>
+</section>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
+<script>
+const usd = n => "$" + (n ?? 0).toFixed(4);
+const short = ts => (ts || "").slice(5, 16).replace("T", " ");
+const STATUS_COLOR = {merged:"#16a34a", closed:"#dc2626", opened:"#2563eb", gated:"#9ca3af"};
+const mk = (id, cfg) => new Chart(document.getElementById(id), cfg);
+
+async function renderAnalytics() {
+  const [runs, wh, cfg] = await Promise.all(
+    ["/api/runs", "/api/weight-history", "/api/weights"].map(u => fetch(u).then(r => r.json()))
+  );
+  runs.reverse();                                    // API returns newest first
+
+  // cost
+  const costed = runs.filter(r => r.cost?.total_cost_usd != null);
+  const sum = (rs, k) => rs.reduce((a, r) => a + r.cost[k], 0);
+  const prs = costed.filter(r => r.pr_number);
+  document.getElementById("cost-kpis").textContent =
+    `Total ${usd(sum(costed, "total_cost_usd"))} ` +
+    `(input ${usd(sum(costed, "input_cost_usd"))} / output ${usd(sum(costed, "output_cost_usd"))})` +
+    ` · avg per PR ${prs.length ? usd(sum(prs, "total_cost_usd") / prs.length) : "n/a"}`;
+  mk("costChart", {type: "line", data: {labels: costed.map(r => short(r.created_at)), datasets: [
+    {label: "Total",  data: costed.map(r => r.cost.total_cost_usd),  borderColor: "#111"},
+    {label: "Input",  data: costed.map(r => r.cost.input_cost_usd),  borderColor: "#2563eb"},
+    {label: "Output", data: costed.map(r => r.cost.output_cost_usd), borderColor: "#f59e0b"},
+  ]}, options: {scales: {y: {title: {display: true, text: "USD per run"}}}}});
+
+  // confidence: dots colored by outcome (green merged, red closed, blue open, grey gated)
+  const scored = runs.filter(r => r.confidence_score != null);
+  mk("confChart", {type: "line", data: {labels: scored.map(r => short(r.created_at)), datasets: [
+    {label: "Confidence", data: scored.map(r => r.confidence_score), showLine: false, pointRadius: 5,
+     pointBackgroundColor: scored.map(r => STATUS_COLOR[r.status] || "#9ca3af")},
+    {label: `Threshold (${cfg.threshold})`, data: scored.map(() => cfg.threshold),
+     borderColor: "#dc2626", borderDash: [6, 4], pointRadius: 0},
+  ]}, options: {scales: {y: {min: 0, max: 1}}}});
+
+  // weights over time
+  mk("weightChart", {type: "line", data: {
+    labels: wh.map(s => short(s.ts)),
+    datasets: Object.keys(cfg.weights).map(n =>
+      ({label: n, data: wh.map(s => s.weights[n] ?? null), spanGaps: true})),
+  }});
+}
+renderAnalytics();
+</script>
+
 </body>
 </html>

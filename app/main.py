@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from google.cloud import secretmanager
 
-from app import pipeline, repos_store, store, tuning
+from app import outcomes, pipeline, reconcile, repos_store, store
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,6 +30,17 @@ def _webhook_secret_value() -> str:
     name = f"projects/{_PROJECT}/secrets/github-webhook-secret/versions/latest"
     _webhook_secret = _secret_client.access_secret_version(name=name).payload.data.decode("utf-8")
     return _webhook_secret
+
+
+def _signature_ok(body: bytes, signature: str) -> bool:
+    """Check the HMAC; on mismatch drop the cached secret and retry once (handles secret rotation)."""
+    global _webhook_secret
+    for _ in range(2):
+        expected = "sha256=" + hmac.new(_webhook_secret_value().encode(), body, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, signature):
+            return True
+        _webhook_secret = None
+    return False
 
 
 @app.post("/failure")
@@ -58,29 +69,40 @@ async def failure(request: Request):
 async def github_webhook(request: Request):
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
-    expected = "sha256=" + hmac.new(_webhook_secret_value().encode(), body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature):
+    if not _signature_ok(body, signature):
+        logger.warning("webhook: invalid signature")
         raise HTTPException(status_code=401, detail="invalid signature")
 
-    if request.headers.get("X-GitHub-Event") != "pull_request":
-        return {"status": "ignored"}
+    event = request.headers.get("X-GitHub-Event")
+    if event != "pull_request":
+        logger.info("webhook: ignored event=%s", event)
+        return {"status": "ignored", "event": event}
 
     payload = json.loads(body)
-    if payload.get("action") != "closed":
-        return {"status": "ignored"}
+    action = payload.get("action")
+    if action != "closed":
+        logger.info("webhook: ignored pull_request action=%s", action)
+        return {"status": "ignored", "action": action}
 
     pr = payload["pull_request"]
-    pr_number = pr["number"]
+    pr_number = int(pr["number"])
     merged = bool(pr.get("merged"))
+    repo_full = (payload.get("repository") or {}).get("full_name")
 
-    doc_id, run = store.find_by_pr_number(pr_number)
+    doc_id, run = store.find_by_pr_number(pr_number, repo_full)
     if not run:
-        return {"status": "no_matching_run"}
+        logger.warning("webhook: no run found for PR #%s in %s", pr_number, repo_full)
+        return {"status": "no_matching_run", "pr_number": pr_number}
 
-    store.upsert_run(doc_id, {"status": "merged" if merged else "closed"})
-    tuning.apply_outcome(run, merged=merged, proposed_fix=run.get("proposed_fix", ""), doc_id=doc_id)
+    result = outcomes.record_outcome(doc_id, run, merged=merged, source="webhook")
+    logger.info("webhook: PR #%s merged=%s run=%s -> %s", pr_number, merged, doc_id, result.get("status"))
+    return result
 
-    return {"status": "recorded", "merged": merged}
+
+@app.post("/api/reconcile")
+async def api_reconcile():
+    report = reconcile.reconcile_open_prs()
+    return {"checked": len(report), "results": report}
 
 
 @app.get("/api/runs")

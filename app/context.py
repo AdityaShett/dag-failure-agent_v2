@@ -1,11 +1,13 @@
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from google.cloud import logging as cloud_logging
-from google.api_core.exceptions import ResourceExhausted
+
+from app.confidence import parse_log
 
 
 def _parse_failure_time_from_run_id(run_id: str) -> datetime:
+    # vestigial: kept for call-site compatibility
     _, _, ts = (run_id or "").partition("__")
     if not ts:
         return datetime.now(timezone.utc)
@@ -39,37 +41,39 @@ def _payload_to_text(payload) -> str:
     return str(payload)
 
 
-def fetch_task_logs(filter_str: str) -> str:
+def _looks_complete(text: str) -> bool:
+    """True once the log contains a parseable traceback (frames + exception line)."""
+    parsed = parse_log(text)
+    return bool(parsed["frames"] and parsed["exception_type"])
+
+
+def fetch_task_logs(filter_str: str, max_retries: int = 5, base_delay: int = 2) -> str:
+    """
+    Cloud Logging ingestion lags the failure callback. The old version only retried on ZERO
+    entries, so a partial batch (start of the task log, no traceback yet) was returned as-is,
+    giving empty signals / a blank fingerprint. Now we keep polling until the traceback shows
+    up, and fall back to the largest batch seen if it never does (e.g. task killed, no traceback).
+    Worst-case added latency: 2+4+8+16 = 30s.
+    """
     client = cloud_logging.Client()
-    max_retries = 5
-    base_delay = 2
+    best = ""
 
     for attempt in range(max_retries):
         try:
-            entries = list(
-                client.list_entries(
-                    filter_=filter_str,
-                    order_by=cloud_logging.DESCENDING,
-                    max_results=200,
-                )
-            )
-            if entries:
-                lines = [_payload_to_text(e.payload) for e in entries]
-                return "\n".join(reversed(lines))
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
-                continue
-            return ""
-        except ResourceExhausted:
-            if attempt == max_retries - 1:
-                raise
-            time.sleep(base_delay * (2 ** attempt))
+            entries = list(client.list_entries(
+                filter_=filter_str, order_by=cloud_logging.DESCENDING, max_results=200))
+            text = "\n".join(reversed([_payload_to_text(e.payload) for e in entries]))
+            if len(text) > len(best):
+                best = text
+            if _looks_complete(text):
+                return text
         except Exception:
-            if attempt == max_retries - 1:
+            if attempt == max_retries - 1 and not best:
                 raise
+        if attempt < max_retries - 1:
             time.sleep(base_delay * (2 ** attempt))
 
-    return ""
+    return best
 
 
 def fetch_dag_source(github_repo: str, target_file: str, ref: str = None) -> str:

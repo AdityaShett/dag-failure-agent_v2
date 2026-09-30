@@ -1,32 +1,53 @@
+import logging
+
 from app import diff_utils, store
+
+logger = logging.getLogger(__name__)
 
 SMALL_DIFF_LINES = 3
 WEIGHT_FLOOR = 0.01
 
 
-def apply_outcome(run: dict, merged: bool, proposed_fix: str = "", doc_id: str = None):
+def apply_outcome(run: dict, merged: bool, proposed_fix: str = "", doc_id: str = None) -> dict:
+
     shares = run.get("confidence_shares")
     confidence_score = run.get("confidence_score")
     if not shares or confidence_score is None:
-        return
+        return {"applied": False, "reason": "run has no confidence_shares/score"}
 
-    cfg = store.get_weights()
-    weights = dict(cfg["weights"])
-    step = cfg["penalty"]
+    small = bool(merged) and diff_utils.diff_line_count(proposed_fix) < SMALL_DIFF_LINES
+    deltas = {}
 
-    small = merged and diff_utils.diff_line_count(proposed_fix) < SMALL_DIFF_LINES
+    def mutate(cfg):
+        step = cfg["penalty"]
+        weights = dict(cfg["weights"])
+        deltas.clear()
+        for name, share in shares.items():
+            if name not in weights:
+                continue
+            if merged and not small:
+                change = step * share
+            elif merged and small:
+                change = -step * share
+            else:
+                change = -step * confidence_score * share
+            new = max(WEIGHT_FLOOR, weights[name] + change)
+            deltas[name] = round(new - weights[name], 6)
+            weights[name] = new
+        cfg["weights"] = weights
+        return cfg
 
-    for name, share in shares.items():
-        if name not in weights:
-            continue
-        if merged and not small:
-            weights[name] += step * share
-        elif merged and small:
-            weights[name] -= cfg["penalty"] * share
-        else:
-            weights[name] -= cfg["penalty"] * confidence_score * share
-        weights[name] = max(WEIGHT_FLOOR, weights[name])
+    cfg = store.update_weights(mutate)
+    inactive = sorted(n for n, s in shares.items() if not s)
+    branch = "reward" if (merged and not small) else "small_diff_penalty" if merged else "closed_penalty"
 
-    cfg["weights"] = weights
-    store.save_weights(cfg)
-    store.append_weight_snapshot(weights, source="outcome", run_doc_id=doc_id, merged=merged)
+    store.append_weight_snapshot(
+        cfg["weights"], source="outcome", run_doc_id=doc_id, merged=merged,
+        deltas=deltas, inactive_signals=inactive, branch=branch,
+    )
+    summary = {"applied": True, "branch": branch, "deltas": deltas, "inactive_signals": inactive}
+    if doc_id:
+        store.upsert_run(doc_id, {"tuning": summary})
+    logger.info("tuning: run=%s merged=%s branch=%s deltas=%s inactive=%s",
+                doc_id, merged, branch, deltas, inactive)
+    return summary
