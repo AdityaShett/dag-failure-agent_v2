@@ -45,7 +45,7 @@ def find_related_failures(current_doc_id, dag_id, exc, fingerprint):
 
     related = []
     for doc_id, run in pool.items():
-        if doc_id == current_doc_id or run.get("status") not in OUTCOME_VALUE:
+        if doc_id == current_doc_id or run.get("status") not in ("merged", "closed") or run.get("diff_applied") is False:
             continue
         strength, reason = _strength(run, dag_id, exc, fingerprint)
         if strength:
