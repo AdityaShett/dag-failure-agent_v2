@@ -4,4 +4,5 @@ MASTER.md
 *.env
 dashboard-sa-key.json
 github-webhook-secret.txt
-.venv/
+.venv/weights-export.json
+weights-export.json
