@@ -21,7 +21,7 @@ def run_invoice_report():
     orders = [
         {"id": 1, "quantity": 3, "unit_price": 19.99, "discount": 5.0},
         {"id": 2, "quantity": 1, "unit_price": 249.0, "discount": 0.0},
-        {"id": 3, "quantity": 12, "unit_price": 4.5},
+        {"id": 3, "quantity": 12, "unit_price": 4.5, "discount": 0.0},
     ]
     print("processing orders:", len(orders))
     total = build_invoice(orders)
