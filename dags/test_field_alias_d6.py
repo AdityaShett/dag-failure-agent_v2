@@ -8,7 +8,7 @@ from agent_failure_callback import notify_dag_failure_agent
 def normalize_contact(record):
     return {
         "name": record["name"],
-        "email": record["email"],
+        "email": record.get("email") or record.get("email_address"),
     }
 
 
