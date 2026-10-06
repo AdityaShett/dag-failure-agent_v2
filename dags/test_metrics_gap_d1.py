@@ -6,7 +6,7 @@ from agent_failure_callback import notify_dag_failure_agent
 
 
 def build_metrics_template():
-    return {"processed": 0, "errors": 0}
+    return {"processed": 0, "errors": 0, "skipped": 0}
 
 
 def record_batch_result(metrics, batch_had_errors, batch_was_skipped):
