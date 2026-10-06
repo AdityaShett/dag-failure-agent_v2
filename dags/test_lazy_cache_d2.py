@@ -17,7 +17,9 @@ _CONNECTION_CACHE = {}
 
 
 def get_connection(name):
-    return _CONNECTION_CACHE.get(name)
+    if name not in _CONNECTION_CACHE:
+        _CONNECTION_CACHE[name] = Connection(name)
+    return _CONNECTION_CACHE[name]
 
 
 def run_query_on(name, query):
