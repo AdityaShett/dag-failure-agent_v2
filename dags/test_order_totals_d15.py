@@ -7,7 +7,7 @@ from agent_failure_callback import notify_dag_failure_agent
 
 def line_total(order):
     gross = order["quantity"] * order["unit_price"]
-    return gross - order["discount"]
+    return gross - order.get("discount", 0.0)
 
 
 def build_invoice(orders):
