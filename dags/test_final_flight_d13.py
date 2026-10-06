@@ -10,7 +10,7 @@ def read_setting(settings, key):
 
 
 def run_final_flight():
-    settings = {"mode": "batch", "region": "us-central1"}
+    settings = {"mode": "batch", "region": "us-central1", "owner": "airflow"}
     print("mode:", read_setting(settings, "mode"))
     print("owner:", read_setting(settings, "owner"))
 
