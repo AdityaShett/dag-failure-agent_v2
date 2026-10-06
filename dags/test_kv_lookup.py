@@ -6,7 +6,7 @@ from agent_failure_callback import notify_dag_failure_agent
 
 
 def look_up_service_tier():
-    config = {"environment": "prod", "region": "us-central1"}
+    config = {"environment": "prod", "region": "us-central1", "service_tier": "standard"}
     print("looking up tier for", config["environment"])
     tier = config["service_tier"]
     print("tier:", tier)
