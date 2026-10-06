@@ -6,8 +6,7 @@ from agent_failure_callback import notify_dag_failure_agent
 
 
 def fetch_readings(sensor_id):
-    if sensor_id == "temp-04":
-        return {"value": 71.2, "unit": "F"}
+    # Ensure consistent return type: always a list of dictionaries
     return [{"value": 71.2, "unit": "F"}]
 
 
