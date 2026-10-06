@@ -5,7 +5,8 @@ from airflow.operators.python import PythonOperator
 from agent_failure_callback import notify_dag_failure_agent
 
 
-def enqueue_jobs(jobs, queue=[]):
+def enqueue_jobs(jobs):
+    queue = []
     for job in jobs:
         queue.append(job)
     return queue
