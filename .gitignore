@@ -11,3 +11,7 @@ MASTER.md
 github-webhook-secret.txt
 weights-export.json
 composer-env-config.txt
+
+.venv/
+__pycache__/
+*.pyc
