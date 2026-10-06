@@ -1,11 +1,13 @@
 import json
 import os
+import time
 from datetime import datetime, timezone
 
 from google.cloud import firestore
 
 _client = None
 WEIGHTS_SEED_PATH = os.environ.get("WEIGHTS_SEED_PATH", "config/weights.json")
+IN_PROGRESS = ("processing", "scoring", "generating")
 
 
 def _db():
@@ -43,8 +45,36 @@ def upsert_run(doc_id: str, fields: dict):
     ref.set(fields, merge=True)
 
 
-def transition_status(doc_id: str, from_statuses, to_status: str, extra: dict = None):
+def claim_run(doc_id: str, fields: dict, stale_after: int, max_attempts: int) -> str:
+    ref = _db().collection("runs").document(doc_id)
 
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        run = snap.to_dict() if snap.exists else {}
+        status = run.get("status")
+        if status in IN_PROGRESS:
+            if time.time() - run.get("started_at", 0) < stale_after:
+                return "in_progress"
+        elif status and status != "error":
+            return "duplicate_skipped"
+
+        now = _now()
+        attempts = run.get("attempts", 0) + 1
+        if attempts > max_attempts:
+            txn.set(ref, {"status": "error", "error": "gave up after repeated failures", "updated_at": now}, merge=True)
+            return "error_giving_up"
+
+        txn.set(ref, {
+            **fields, "status": "processing", "attempts": attempts, "started_at": time.time(),
+            "updated_at": now, "created_at": run.get("created_at", now),
+        }, merge=True)
+        return "claimed"
+
+    return _txn(_db().transaction())
+
+
+def transition_status(doc_id: str, from_statuses, to_status: str, extra: dict = None):
     db = _db()
     ref = db.collection("runs").document(doc_id)
 
@@ -63,7 +93,6 @@ def transition_status(doc_id: str, from_statuses, to_status: str, extra: dict = 
 
 
 def find_by_pr_number(pr_number, github_repo: str = None):
-
     docs = []
     for candidate in (int(pr_number), str(pr_number)):
         docs = list(_db().collection("runs").where("pr_number", "==", candidate).limit(20).stream())
@@ -75,7 +104,7 @@ def find_by_pr_number(pr_number, github_repo: str = None):
     if github_repo:
         same_repo = [d for d in docs if (d.to_dict().get("github_repo") or "").lower() == github_repo.lower()]
         docs = same_repo or docs
-    docs.sort(key=lambda d: d.to_dict().get("status") != "opened")   # opened first
+    docs.sort(key=lambda d: d.to_dict().get("status") != "opened")
     return docs[0].id, docs[0].to_dict()
 
 
@@ -114,7 +143,7 @@ def get_weights() -> dict:
     if snap.exists:
         cfg = snap.to_dict()
         for name, w in seed["weights"].items():
-            cfg["weights"].setdefault(name, w)   # picks up newly added signals
+            cfg["weights"].setdefault(name, w)
         return cfg
     ref.set(seed)
     return seed
@@ -125,7 +154,6 @@ def save_weights(cfg: dict):
 
 
 def update_weights(mutator) -> dict:
-
     db = _db()
     ref = db.collection("config").document("weights")
     seed = _seed()

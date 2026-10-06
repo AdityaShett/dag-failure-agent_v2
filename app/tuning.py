@@ -10,6 +10,9 @@ WEIGHT_FLOOR = 0.01
 
 def apply_outcome(run: dict, merged: bool, proposed_fix: str = "", doc_id: str = None) -> dict:
 
+    if run.get("diff_applied") is False:
+        return {"applied": False, "reason": "no fix was proposed"}
+
     shares = run.get("confidence_shares")
     confidence_score = run.get("confidence_score")
     if not shares or confidence_score is None:

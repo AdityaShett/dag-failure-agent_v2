@@ -47,14 +47,8 @@ def _looks_complete(text: str) -> bool:
     return bool(parsed["frames"] and parsed["exception_type"])
 
 
-def fetch_task_logs(filter_str: str, max_retries: int = 5, base_delay: int = 2) -> str:
-    """
-    Cloud Logging ingestion lags the failure callback. The old version only retried on ZERO
-    entries, so a partial batch (start of the task log, no traceback yet) was returned as-is,
-    giving empty signals / a blank fingerprint. Now we keep polling until the traceback shows
-    up, and fall back to the largest batch seen if it never does (e.g. task killed, no traceback).
-    Worst-case added latency: 2+4+8+16 = 30s.
-    """
+def fetch_task_logs(filter_str: str, max_retries: int = 6, base_delay: int = 2) -> str:
+
     client = cloud_logging.Client()
     best = ""
 

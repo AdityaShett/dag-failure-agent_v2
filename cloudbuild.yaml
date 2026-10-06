@@ -15,6 +15,7 @@ steps:
       - --region=us-central1
       - --platform=managed
       - --allow-unauthenticated
+      - --timeout=600
       - --set-env-vars=GCP_PROJECT=$PROJECT_ID,GCP_LOCATION=us-central1,GEMINI_MODEL_NAME=gemini-2.5-flash,REPOS_CONFIG_BUCKET=$PROJECT_ID-repos-config,REPOS_CONFIG_BLOB=repos.json,WEIGHTS_SEED_PATH=config/weights.json,AGENT_FAILURE_TOPIC=dagfailures
 
 images:

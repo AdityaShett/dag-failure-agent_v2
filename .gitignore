@@ -6,3 +6,8 @@ dashboard-sa-key.json
 github-webhook-secret.txt
 .venv/weights-export.json
 weights-export.json
+
+MASTER.md
+github-webhook-secret.txt
+weights-export.json
+composer-env-config.txt

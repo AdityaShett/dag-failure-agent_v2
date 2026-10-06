@@ -1,0 +1,2277 @@
+================================================================================
+FILE: app\__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: app\confidence.py
+================================================================================
+
+import re
+import hashlib
+
+SIGNAL_NAMES = (
+    "stack_trace_present", "line_number_matches_source",
+    "known_fix_pattern_match", "log_completeness",
+    "failure_history",
+)
+
+_TRACEBACK_HEADER = re.compile(r"Traceback \(most recent call last\)", re.IGNORECASE)
+_FRAME_RE = re.compile(r'File "(?P<file>[^"]+)", line (?P<line>\d+), in (?P<func>[^\s]+)')
+_EXC_RE = re.compile(
+    r"^(?:\[[^\]]*\]\s*)?(?:[A-Za-z_][\w.]*\s*-\s*)?"
+    r"(?P<exc>(?:[a-zA-Z_][\w]*\.)*[A-Z][\w]*(?:Error|Exception|Timeout))"
+    r"\s*:\s*(?P<msg>.*)$"
+)
+_LEVEL_RE = re.compile(r"\b(ERROR|CRITICAL|WARNING|INFO|DEBUG)\b")
+_TIMESTAMP_RE = re.compile(r"\[\d{4}-\d{2}-\d{2}[ T,]")
+_EXTERNAL_PATH_MARKERS = ("/site-packages/", "\\site-packages\\", "/dist-packages/")
+
+
+OUTCOME_VALUE = {"merged": 1.0, "opened": 0.5, "gated": 0.4, "closed": 0.0}
+MIN_HISTORY_STRENGTH = 0.5
+_STRING_LITERAL = re.compile(r"""(['"])(?:(?!\1).)*\1""")
+
+KNOWN_FIX_PATTERNS = {
+    "KeyError", "FileNotFoundError", "AttributeError", "ModuleNotFoundError",
+    "ImportError", "NameError", "IndexError", "TypeError", "ValueError",
+    "UnboundLocalError", "ZeroDivisionError",
+}
+
+
+def _strip_log_prefix(line: str) -> str:
+    line = re.sub(r"^\ufeff", "", line)
+    line = re.sub(r"^\[[^\]]*\]\s*", "", line)
+    line = re.sub(r"^\{[^}]*\}\s*", "", line)
+    line = re.sub(r"^(ERROR|CRITICAL|WARNING|INFO|DEBUG)\s*-\s*", "", line)
+    return line
+
+
+def _normalize_code(code: str) -> str:
+    return re.sub(r"\s+", "", code or "")
+
+def error_fingerprint(parsed: dict) -> str:
+    exc = (parsed.get("exception_type") or "").rsplit(".", 1)[-1]
+    code = (parsed.get("app_frame") or {}).get("code", "")
+    code = re.sub(r"\d+", "N", _STRING_LITERAL.sub("S", code))
+    code = _normalize_code(code)
+    if not exc or not code:
+        return ""
+    return f"{exc}:{hashlib.sha1(code.encode()).hexdigest()[:12]}"
+
+
+def parse_log(task_logs: str) -> dict:
+    text = task_logs or ""
+    raw_lines = text.splitlines()
+    lines = [_strip_log_prefix(l) for l in raw_lines]
+
+    frames = []
+    for i, line in enumerate(lines):
+        m = _FRAME_RE.search(line)
+        if not m:
+            continue
+        code = ""
+        if i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if nxt and not _FRAME_RE.search(nxt) and not _EXC_RE.match(nxt):
+                code = nxt
+        frames.append({"file": m.group("file"), "line": int(m.group("line")),
+                        "func": m.group("func"), "code": code})
+
+    exception_type = None
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = _EXC_RE.match(stripped)
+        if m:
+            exception_type = m.group("exc")
+            break
+
+    app_frame = None
+    for frame in reversed(frames):
+        if not any(marker in frame["file"] for marker in _EXTERNAL_PATH_MARKERS):
+            app_frame = frame
+            break
+
+    return {
+        "has_traceback": bool(_TRACEBACK_HEADER.search(text)),
+        "frames": frames,
+        "app_frame": app_frame,
+        "exception_type": exception_type,
+        "has_timestamps": bool(_TIMESTAMP_RE.search(text)),
+        "has_level": bool(_LEVEL_RE.search(text)),
+        "line_count": len([l for l in raw_lines if l.strip()]),
+    }
+
+
+def signal_stack_trace_present(parsed: dict) -> float:
+    if parsed["has_traceback"] and parsed["frames"] and parsed["exception_type"]:
+        return 1.0
+    if parsed["frames"] and parsed["exception_type"]:
+        return 0.8
+    if parsed["exception_type"]:
+        return 0.4
+    return 0.0
+
+
+def signal_line_number_matches_source(parsed: dict, dag_source: str, tolerance: int = 3) -> float:
+    source = dag_source or ""
+    if not source.strip():
+        return 0.0
+
+    frame = parsed.get("app_frame")
+    if not frame:
+        return 0.0
+
+    src_lines = source.splitlines()
+    n = len(src_lines)
+    code = _normalize_code(frame.get("code", ""))
+
+    if code:
+        target = frame["line"]
+        lo, hi = max(1, target - tolerance), min(n, target + tolerance)
+        for idx in range(lo, hi + 1):
+            if _normalize_code(src_lines[idx - 1]) == code:
+                return 1.0
+        for src_line in src_lines:
+            if _normalize_code(src_line) == code:
+                return 0.6
+        if len(code) >= 12:
+            for src_line in src_lines:
+                if code in _normalize_code(src_line):
+                    return 0.6
+        return 0.0
+
+    func = frame.get("func")
+    in_range = 1 <= frame["line"] <= n
+    func_present = bool(func) and (
+        func == "<module>" or re.search(rf"\bdef\s+{re.escape(func)}\b", source)
+    )
+    return 0.25 if (in_range and func_present) else 0.0
+
+
+def signal_known_fix_pattern_match(parsed: dict) -> float:
+    exc = parsed.get("exception_type")
+    if not exc:
+        return 0.0
+    short = exc.rsplit(".", 1)[-1]
+    return 1.0 if short in KNOWN_FIX_PATTERNS else 0.0
+
+
+def signal_log_completeness(parsed: dict, task_logs: str, dag_id: str = "", task_id: str = "") -> float:
+    text = task_logs or ""
+    checks = [
+        parsed["has_timestamps"],
+        parsed["has_level"],
+        parsed["line_count"] >= 4,
+        bool(task_id) and task_id in text,
+        bool(dag_id) and dag_id in text,
+        len(text) >= 200,
+    ]
+    return round(sum(1 for c in checks if c) / len(checks), 4)
+
+
+def signal_failure_history(history):
+    if not history:
+        return None
+    total = sum(h["strength"] for h in history)
+    if total < MIN_HISTORY_STRENGTH:
+        return None                      # inactive
+    weighted = sum(h["strength"] * OUTCOME_VALUE[h["status"]] for h in history)
+    return round((weighted + 0.5) / (total + 1.0), 4) 
+
+
+def extract_signals(task_logs: str, dag_source: str, dag_id: str = "", task_id: str = "",
+                     history: list = None) -> dict:
+    parsed = parse_log(task_logs)
+    return {
+        "stack_trace_present": signal_stack_trace_present(parsed),
+        "line_number_matches_source": signal_line_number_matches_source(parsed, dag_source),
+        "known_fix_pattern_match": signal_known_fix_pattern_match(parsed),
+        "log_completeness": signal_log_completeness(parsed, task_logs, dag_id, task_id),
+        "failure_history": signal_failure_history(history),
+    }
+
+
+def score(signals: dict, weights: dict) -> dict:
+    numer = 0.0
+    denom = 0.0
+    contributions = {}
+    for name in SIGNAL_NAMES:
+        w = float(weights.get(name, 0.0))
+        raw = signals.get(name)
+        if raw is None:                      # inactive: out of numer AND denom
+            contributions[name] = 0.0
+            continue
+        s = max(0.0, min(1.0, float(raw)))
+        contributions[name] = w * s
+        numer += w * s
+        denom += w
+
+    value = max(0.0, min(1.0, numer / denom if denom > 0 else 0.0))
+    total_contribution = sum(contributions.values()) or 1.0
+    shares = {name: c / total_contribution for name, c in contributions.items()}
+
+    return {"score": round(value, 4), "contributions": contributions, "shares": shares}
+
+
+================================================================================
+FILE: app\context.py
+================================================================================
+
+import time
+from datetime import datetime, timezone
+
+from google.cloud import logging as cloud_logging
+
+from app.confidence import parse_log
+
+
+def _parse_failure_time_from_run_id(run_id: str) -> datetime:
+    # vestigial: kept for call-site compatibility
+    _, _, ts = (run_id or "").partition("__")
+    if not ts:
+        return datetime.now(timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return datetime.now(timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def build_task_log_filter(dag_id: str, task_id: str, run_id: str = None,
+                           lookback_minutes: int = 120) -> str:
+    parts = [
+        'resource.type="cloud_composer_environment"',
+        'logName:"logs/airflow-worker"',
+    ]
+    if dag_id:
+        parts.append(f'labels."workflow"="{dag_id}"')
+    if task_id:
+        parts.append(f'labels."task-id"="{task_id}"')
+    if run_id:
+        parts.append(f'labels."run-id"="{run_id}"')
+    return " AND ".join(parts)
+
+
+def _payload_to_text(payload) -> str:
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        return payload.get("message") or payload.get("textPayload") or str(payload)
+    return str(payload)
+
+
+def _looks_complete(text: str) -> bool:
+    """True once the log contains a parseable traceback (frames + exception line)."""
+    parsed = parse_log(text)
+    return bool(parsed["frames"] and parsed["exception_type"])
+
+
+def fetch_task_logs(filter_str: str, max_retries: int = 6, base_delay: int = 2) -> str:
+
+    client = cloud_logging.Client()
+    best = ""
+
+    for attempt in range(max_retries):
+        try:
+            entries = list(client.list_entries(
+                filter_=filter_str, order_by=cloud_logging.DESCENDING, max_results=200))
+            text = "\n".join(reversed([_payload_to_text(e.payload) for e in entries]))
+            if len(text) > len(best):
+                best = text
+            if _looks_complete(text):
+                return text
+        except Exception:
+            if attempt == max_retries - 1 and not best:
+                raise
+        if attempt < max_retries - 1:
+            time.sleep(base_delay * (2 ** attempt))
+
+    return best
+
+
+def fetch_dag_source(github_repo: str, target_file: str, ref: str = None) -> str:
+    from github import Auth, Github
+    from app.github_ops import get_github_token
+
+    auth = Auth.Token(get_github_token(github_repo))
+    gh = Github(auth=auth)
+    repo = gh.get_repo(github_repo)
+
+    resolved_ref = ref or repo.default_branch
+    try:
+        contents = repo.get_contents(target_file, ref=resolved_ref)
+    except Exception:
+        if ref and ref != repo.default_branch:
+            contents = repo.get_contents(target_file, ref=repo.default_branch)
+        else:
+            raise
+
+    return contents.decoded_content.decode("utf-8")
+
+================================================================================
+FILE: app\cost.py
+================================================================================
+
+PRICING_USD_PER_M = {
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+}
+
+
+def usage_from_response(resp) -> dict:
+    u = getattr(resp, "usage_metadata", None)
+    thoughts = getattr(u, "thoughts_token_count", 0) or 0
+    return {
+        "input_tokens": getattr(u, "prompt_token_count", 0) or 0,
+        "output_tokens": (getattr(u, "candidates_token_count", 0) or 0) + thoughts,
+        "thinking_tokens": thoughts,
+    }
+
+
+def build_cost_record(model: str, calls: dict) -> dict:
+    in_tok = sum(c["input_tokens"] for c in calls.values())
+    out_tok = sum(c["output_tokens"] for c in calls.values())
+    record = {"model": model, "calls": calls, "input_tokens": in_tok, "output_tokens": out_tok}
+    rates = PRICING_USD_PER_M.get(model)
+    if rates:
+        in_cost = in_tok / 1e6 * rates["input"]
+        out_cost = out_tok / 1e6 * rates["output"]
+        record.update(rates_usd_per_m=rates, input_cost_usd=in_cost,
+                      output_cost_usd=out_cost, total_cost_usd=in_cost + out_cost)
+    return record
+
+================================================================================
+FILE: app\diff_utils.py
+================================================================================
+
+import difflib
+
+
+def make_diff(source: str, fixed: str, path: str) -> str:
+    return "\n".join(difflib.unified_diff(
+        source.splitlines(), fixed.splitlines(), f"a/{path}", f"b/{path}", lineterm=""))
+
+
+def diff_line_count(diff_text: str) -> int:
+    return sum(
+        1 for line in (diff_text or "").splitlines()
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    )
+
+================================================================================
+FILE: app\github_ops.py
+================================================================================
+
+import os
+
+from github import Auth, Github, GithubException
+from google.cloud import secretmanager
+
+from app import repos_store
+
+_secret_client = None
+_token_cache = {}
+_PROJECT_ID = os.environ.get("GCP_PROJECT")
+
+
+def _secrets():
+    global _secret_client
+    if _secret_client is None:
+        _secret_client = secretmanager.SecretManagerServiceClient()
+    return _secret_client
+
+
+def get_github_token(github_repo: str) -> str:
+    if github_repo in _token_cache:
+        return _token_cache[github_repo]
+
+    data = repos_store.load_repos()
+    entry = data.get(github_repo)
+    if not entry:
+        raise ValueError(f"'{github_repo}' is not registered — add it from the dashboard")
+
+    secret_name = entry["token_secret"]
+    version_name = f"projects/{_PROJECT_ID}/secrets/{secret_name}/versions/latest"
+    token = _secrets().access_secret_version(name=version_name).payload.data.decode("utf-8")
+    _token_cache[github_repo] = token
+    return token
+
+
+def open_draft_pr(github_repo: str, target_file: str, dag_id: str, task_id: str,
+                  run_id: str, doc_id: str, root_cause: str, new_source: str,
+                  proposed_fix: str, fallback_reason, confidence_score: float) -> dict:
+    repo = Github(auth=Auth.Token(get_github_token(github_repo))).get_repo(github_repo)
+    base_branch = repo.default_branch
+    branch_name = f"agent-fix/{doc_id}"
+
+    try:
+        repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=repo.get_branch(base_branch).commit.sha)
+    except GithubException as e:
+        if e.status != 422:
+            raise
+
+    contents = repo.get_contents(target_file, ref=branch_name)
+    if contents.decoded_content.decode("utf-8") != new_source:
+        repo.update_file(
+            path=target_file,
+            message=f"Agent-proposed fix for {task_id} failure ({run_id})",
+            content=new_source, sha=contents.sha, branch=branch_name,
+        )
+
+    applied = fallback_reason is None
+    tier = "high" if confidence_score >= 0.85 else "medium" if confidence_score >= 0.6 else "low"
+    title_prefix = f"[agent][{tier}-confidence]" + ("" if applied else " [no-diff-applied]")
+    fix_section = (
+        f"```diff\n{proposed_fix}\n```" if applied else
+        f"No automatic fix could be produced ({fallback_reason}). A comment was added to the file "
+        "so this pull request exists; use the root cause above."
+    )
+
+    pr_body = (
+        f"## Root cause\n{root_cause or 'The model did not return a root cause.'}\n\n"
+        f"## Proposed fix\n{fix_section}\n\n"
+        f"**Confidence score:** {confidence_score} ({tier})\n\n"
+        f"**Diff applied:** {applied}\n\n"
+        "This pull request was opened automatically. A human review is required before merging.\n\n"
+        f"Run: `{run_id}`  Task: `{task_id}`"
+    )
+
+    open_prs = list(repo.get_pulls(state="open", head=f"{repo.owner.login}:{branch_name}"))
+    pr = open_prs[0] if open_prs else repo.create_pull(
+        title=f"{title_prefix} Fix for {dag_id}.{task_id} failure",
+        body=pr_body, head=branch_name, base=base_branch, draft=True,
+    )
+
+    return {"pr_number": pr.number, "pr_url": pr.html_url, "diff_applied": applied,
+            "fallback_reason": fallback_reason}
+
+================================================================================
+FILE: app\history.py
+================================================================================
+
+import difflib
+import re
+
+from app import store
+from app.confidence import OUTCOME_VALUE
+
+NAME_SIMILARITY_MIN = 0.6
+
+
+def dag_family(dag_id: str) -> str:
+    name = re.sub(r"^(test|dev|prod|staging)_", "", (dag_id or "").lower())
+    return re.sub(r"(_[dv]?\d+|_(dev|prod|staging))+$", "", name)
+
+
+def _similar_name(a, b) -> bool:
+    fa, fb = dag_family(a), dag_family(b)
+    return bool(fa and fb) and (
+        fa == fb or difflib.SequenceMatcher(None, fa, fb).ratio() >= NAME_SIMILARITY_MIN
+    )
+
+
+def _strength(run, dag_id, exc, fp):
+    same_dag = run.get("dag_id") == dag_id
+    same_exc = bool(exc) and run.get("exception_type") == exc
+    same_fp = bool(fp) and run.get("error_fingerprint") == fp
+    if same_dag and same_exc:
+        return 1.0, "same_dag_same_error"
+    if same_fp:
+        return 0.8, "same_error_fingerprint"
+    if same_exc and _similar_name(run.get("dag_id"), dag_id):
+        return 0.5, "similar_dag_same_error"
+    if same_dag:
+        return 0.3, "same_dag_other_error"
+    return 0.0, None
+
+
+def find_related_failures(current_doc_id, dag_id, exc, fingerprint):
+    pool = {}
+    for field, value, limit in (("dag_id", dag_id, 50),
+                                ("error_fingerprint", fingerprint, 50),
+                                ("exception_type", exc, 100)):
+        if value:
+            for run in store.query_runs(field, value, limit):
+                pool[run["id"]] = run
+
+    related = []
+    for doc_id, run in pool.items():
+        if doc_id == current_doc_id or run.get("status") not in ("merged", "closed") or run.get("diff_applied") is False:
+            continue
+        strength, reason = _strength(run, dag_id, exc, fingerprint)
+        if strength:
+            related.append({"id": doc_id, "dag_id": run.get("dag_id"),
+                            "status": run["status"], "strength": strength, "reason": reason})
+    return sorted(related, key=lambda r: -r["strength"])[:10]
+
+================================================================================
+FILE: app\main.py
+================================================================================
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
+from google.cloud import secretmanager
+
+from app import outcomes, pipeline, reconcile, repos_store, store
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+_PROJECT = os.environ.get("GCP_PROJECT")
+_secret_client = None
+_webhook_secret = None
+
+
+def _webhook_secret_value() -> str:
+    global _secret_client, _webhook_secret
+    if _webhook_secret is not None:
+        return _webhook_secret
+    if _secret_client is None:
+        _secret_client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{_PROJECT}/secrets/github-webhook-secret/versions/latest"
+    _webhook_secret = _secret_client.access_secret_version(name=name).payload.data.decode("utf-8")
+    return _webhook_secret
+
+
+def _signature_ok(body: bytes, signature: str) -> bool:
+    """Check the HMAC; on mismatch drop the cached secret and retry once (handles secret rotation)."""
+    global _webhook_secret
+    sig_bytes = (signature or "").encode("utf-8")
+    for _ in range(2):
+        expected = "sha256=" + hmac.new(_webhook_secret_value().encode(), body, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected.encode("utf-8"), sig_bytes):
+            return True
+        _webhook_secret = None
+    return False
+
+
+@app.post("/failure")
+async def failure(request: Request):
+    envelope = await request.json()
+    message = envelope.get("message") or {}
+    try:
+        payload = json.loads(base64.b64decode(message["data"]).decode("utf-8"))
+    except Exception as e:
+        # bad message: return 200 so Pub/Sub doesn't redeliver it forever
+        logger.warning("failure: undecodable Pub/Sub message: %s", e)
+        return {"status": "bad_message"}
+
+    try:
+        result = await asyncio.to_thread(
+            pipeline.process_failure,
+            payload.get("dag_id"), payload.get("task_id"),
+            payload.get("run_id"), payload.get("try_number", 1),
+        )
+    except Exception as e:
+        logger.exception(f"pipeline failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if result.get("status") == "in_progress":
+        raise HTTPException(status_code=503, detail="run in progress")
+    return result
+
+
+@app.post("/github-webhook")
+async def github_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not _signature_ok(body, signature):
+        logger.warning("webhook: invalid signature")
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    event = request.headers.get("X-GitHub-Event")
+    if event != "pull_request":
+        logger.info("webhook: ignored event=%s", event)
+        return {"status": "ignored", "event": event}
+
+    payload = json.loads(body)
+    action = payload.get("action")
+    if action != "closed":
+        logger.info("webhook: ignored pull_request action=%s", action)
+        return {"status": "ignored", "action": action}
+
+    pr = payload["pull_request"]
+    pr_number = int(pr["number"])
+    merged = bool(pr.get("merged"))
+    repo_full = (payload.get("repository") or {}).get("full_name")
+
+    doc_id, run = store.find_by_pr_number(pr_number, repo_full)
+    if not run:
+        logger.warning("webhook: no run found for PR #%s in %s", pr_number, repo_full)
+        return {"status": "no_matching_run", "pr_number": pr_number}
+
+    result = outcomes.record_outcome(doc_id, run, merged=merged, source="webhook")
+    logger.info("webhook: PR #%s merged=%s run=%s -> %s", pr_number, merged, doc_id, result.get("status"))
+    return result
+
+
+@app.post("/api/reconcile")
+async def api_reconcile():
+    report = reconcile.reconcile_open_prs()
+    return {"checked": len(report), "results": report}
+
+
+@app.get("/api/runs")
+async def api_runs():
+    return store.list_runs()
+
+
+@app.delete("/api/runs/{doc_id}")
+async def api_delete_run(doc_id: str):
+    store.delete_run(doc_id)
+    return {"status": "deleted", "id": doc_id}
+
+
+@app.get("/api/weights")
+async def api_weights():
+    return store.get_weights()
+
+
+@app.patch("/api/weights")
+async def api_update_weights(request: Request):
+    body = await request.json()
+    cfg = store.get_weights()
+    for key in ("weights", "penalty", "threshold"):
+        if key in body:
+            cfg[key] = body[key]
+    store.save_weights(cfg)
+    if "weights" in body:
+        store.append_weight_snapshot(cfg["weights"], source="manual")
+    return cfg
+
+
+@app.get("/api/weight-history")
+async def api_weight_history():
+    return store.list_weight_history()
+
+
+@app.get("/api/repos")
+async def api_repos():
+    return repos_store.load_repos()
+
+
+@app.delete("/api/repos/{github_repo:path}")
+async def api_delete_repo(github_repo: str):
+    return repos_store.delete_repo(github_repo)
+
+
+@app.post("/api/repos")
+async def api_add_repo(request: Request):
+    body = await request.json()
+    return repos_store.add_repo(
+        github_repo=body["github_repo"], token_secret=body["token_secret"],
+        dag_path_template=body.get("dag_path_template", "dags/{dag_id}.py"),
+        set_default=bool(body.get("set_default")),
+    )
+
+
+@app.get("/")
+async def dashboard():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "dashboard", "index.html"))
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+================================================================================
+FILE: app\outcomes.py
+================================================================================
+
+import logging
+
+from app import store, tuning
+
+logger = logging.getLogger(__name__)
+
+
+def record_outcome(doc_id: str, run: dict, merged: bool, source: str = "webhook") -> dict:
+
+    new_status = "merged" if merged else "closed"
+    moved = store.transition_status(doc_id, ("opened",), new_status, {"outcome_source": source})
+    if moved is not True:
+        logger.info("outcome skipped: run=%s current_status=%s", doc_id, moved)
+        return {"status": "skipped", "reason": "run_not_in_opened_state", "run_status": moved}
+
+    try:
+        tuned = tuning.apply_outcome(
+            run, merged=merged, proposed_fix=run.get("proposed_fix", ""), doc_id=doc_id)
+    except Exception as e:                       # status is already correct; don't lose that
+        logger.exception("tuning failed for run %s", doc_id)
+        store.upsert_run(doc_id, {"tuning_error": f"{type(e).__name__}: {e}"[:500]})
+        tuned = {"applied": False, "error": str(e)}
+
+    return {"status": "recorded", "merged": merged, "tuning": tuned}
+
+================================================================================
+FILE: app\pipeline.py
+================================================================================
+
+import logging
+import os
+import re
+import time
+
+from google import genai
+from google.genai import types
+
+from app import confidence, context, cost, diff_utils, github_ops, history, repos_store, store
+
+logger = logging.getLogger(__name__)
+
+_GENAI_CLIENT = None
+_MODEL = os.environ.get("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+_PROJECT = os.environ.get("GCP_PROJECT")
+_LOCATION = os.environ.get("GCP_LOCATION", "global")
+
+NO_FIX = "NO_CONFIDENT_FIX"
+FIX_ATTEMPTS = 3
+GEMINI_ATTEMPTS = 3
+MAX_PROCESS_ATTEMPTS = 5
+STALE_AFTER_SECONDS = 600
+_ZERO_USAGE = {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0}
+
+
+def _genai():
+    global _GENAI_CLIENT
+    if _GENAI_CLIENT is None:
+        _GENAI_CLIENT = genai.Client(vertexai=True, project=_PROJECT, location=_LOCATION)
+    return _GENAI_CLIENT
+
+
+def _retry(fn, attempts: int = 3):
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception:
+            if i == attempts - 1:
+                raise
+            logger.exception("attempt %s failed, retrying", i + 1)
+            time.sleep(2 ** i)
+
+
+def _generate(prompt: str):
+    for attempt in range(GEMINI_ATTEMPTS):
+        try:
+            resp = _genai().models.generate_content(
+                model=_MODEL, contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.0),
+            )
+            if resp.text:
+                return resp.text, cost.usage_from_response(resp)
+        except Exception:
+            logger.exception("gemini call failed")
+        time.sleep(2 ** attempt)
+    return "", dict(_ZERO_USAGE)
+
+
+def _focus_logs(logs: str, before: int = 1000, after: int = 6000) -> str:
+    idx = logs.rfind("Traceback (most recent call last)")
+    if idx == -1:
+        return logs[-4000:]
+    return logs[max(0, idx - before): idx + after]
+
+
+def _evidence(parsed: dict) -> str:
+    frame = parsed.get("app_frame")
+    if not parsed.get("exception_type") or not frame:
+        return ""
+    line = f"{parsed['exception_type']} raised at {frame['file']} line {frame['line']} in {frame['func']}"
+    if frame.get("code"):
+        line += f" -> `{frame['code']}`"
+    return f"Parsed from the traceback: {line}"
+
+
+def _ask_root_cause(dag_id, task_id, logs, source, evidence=""):
+    prompt = (
+        "You are an Airflow reliability engineer. Find the exact root cause of this "
+        "task failure. Point to the specific log lines and code lines that prove it. "
+        "If unclear, say so instead of guessing.\n\n"
+        f"DAG: {dag_id} | Task: {task_id}\n\n"
+        + (f"{evidence}\n\n" if evidence else "")
+        + f"--- LOGS ---\n{_focus_logs(logs)}\n\n--- CODE ---\n{source}"
+    )
+    return _generate(prompt)
+
+
+def _fix_prompt(root_cause, source, evidence, error):
+    return (
+        "Fix this Airflow DAG file with the smallest possible change.\n"
+        "Respond with the COMPLETE corrected file only: no explanation, no markdown fences. "
+        f"Change only what the root cause requires. If the bug cannot be fixed in this file, respond with {NO_FIX}.\n\n"
+        + (f"Failure evidence:\n{evidence}\n\n" if evidence else "")
+        + (f"Your previous answer was rejected because {error}. Try again.\n\n" if error else "")
+        + f"Root cause:\n{root_cause}\n\nCurrent code:\n{source}"
+    )
+
+
+def _syntax_error(code: str) -> str:
+    try:
+        compile(code, "dag.py", "exec")
+    except SyntaxError as e:
+        return str(e)
+    return ""
+
+
+def _validate(text: str, source: str):
+    match = re.search(r"```\w*\s*\n(.*?)\n```", text, re.S)
+    code = (match.group(1) if match else text).strip("\n")
+    if not code.strip() or NO_FIX in code:
+        return "", "you returned no file; give your best minimal fix, a human reviews it before merging"
+    eol = "\r\n" if "\r\n" in source else "\n"
+    code = code.replace("\r\n", "\n").replace("\n", eol) + eol
+    if code.splitlines() == source.splitlines():
+        return "", "the file is identical to the original"
+    error = _syntax_error(code)
+    if error and not _syntax_error(source):
+        return "", f"the file has a syntax error: {error}"
+    return code, ""
+
+
+def _ask_fix(root_cause, source, evidence, attempts):
+    usage, error, code, raw, tried = dict(_ZERO_USAGE), "", "", "", 0
+    for _ in range(attempts):
+        raw, used = _generate(_fix_prompt(root_cause, source, evidence, error))
+        tried += 1
+        for key in usage:
+            usage[key] += used[key]
+        code, error = _validate(raw, source)
+        if code:
+            break
+    return code, error, usage, raw, tried
+
+
+def process_failure(dag_id: str, task_id: str, run_id: str, try_number: int = 1) -> dict:
+    doc_id = store.run_id_for(run_id, task_id)
+    claim = store.claim_run(
+        doc_id, {"dag_id": dag_id, "task_id": task_id, "run_id": run_id},
+        STALE_AFTER_SECONDS, MAX_PROCESS_ATTEMPTS)
+    if claim != "claimed":
+        return {"status": claim}
+
+    try:
+        repo_info = repos_store.resolve_repo(dag_id)
+        github_repo, target_file = repo_info["github_repo"], repo_info["target_file"]
+        store.upsert_run(doc_id, {"github_repo": github_repo})
+        return _process(doc_id, dag_id, task_id, run_id, github_repo, target_file)
+    except Exception as e:
+        logger.exception("run %s failed", doc_id)
+        store.upsert_run(doc_id, {"status": "error", "error": f"{type(e).__name__}: {e}"[:500]})
+        raise
+
+
+def _process(doc_id, dag_id, task_id, run_id, github_repo, target_file) -> dict:
+    logs = context.fetch_task_logs(
+        context.build_task_log_filter(dag_id=dag_id, task_id=task_id, run_id=run_id)
+    )
+    source = _retry(lambda: context.fetch_dag_source(github_repo, target_file))
+    store.upsert_run(doc_id, {"status": "scoring"})
+
+    parsed = confidence.parse_log(logs)
+    exc = (parsed["exception_type"] or "").rsplit(".", 1)[-1]
+    fingerprint = confidence.error_fingerprint(parsed)
+    related = history.find_related_failures(doc_id, dag_id, exc, fingerprint)
+
+    signals = confidence.extract_signals(logs, source, dag_id, task_id, history=related)
+    weights = store.get_weights()
+    threshold = weights["threshold"]
+    result = confidence.score(signals, weights["weights"])
+
+    line_signal = signals["line_number_matches_source"]
+    frame = parsed.get("app_frame") or {}
+    source_drift = bool(source.strip() and frame.get("code")) and line_signal == 0.0
+
+    store.upsert_run(doc_id, {
+        "signals": signals, "contributions": result["contributions"],
+        "confidence_shares": result["shares"],
+        "confidence_score": result["score"], "threshold": threshold,
+        "exception_type": exc, "error_fingerprint": fingerprint,
+        "history_matches": related, "log_chars": len(logs),
+        "source_drift": source_drift,
+    })
+
+    evidence = _evidence(parsed)
+    root_cause, rc_usage = _ask_root_cause(dag_id, task_id, logs, source, evidence)
+    above = result["score"] >= threshold
+    fixed, fix_error, fix_usage, fix_raw, tried = _ask_fix(
+        root_cause, source, evidence, FIX_ATTEMPTS if above else 1)
+    proposed_fix = diff_utils.make_diff(source, fixed, target_file) if fixed else NO_FIX
+    store.upsert_run(doc_id, {
+        "cost": cost.build_cost_record(_MODEL, {"root_cause": rc_usage, "fix": fix_usage}),
+        "fix_attempts": tried, "proposed_fix": proposed_fix,
+    })
+
+    if not above:
+        store.upsert_run(doc_id, {
+            "status": "gated", "gate_reason": "below_threshold",
+            "refused": not fixed, "below_threshold": True,
+            "fix_raw": "" if fixed else fix_raw[:1000],
+        })
+        return {"status": "gated", "gate_reason": "below_threshold", "confidence_score": result["score"]}
+
+    new_source = fixed or (
+        source.rstrip("\n") + "\n\n# agent could not propose an automatic fix, see the PR description\n")
+    pr = _retry(lambda: github_ops.open_draft_pr(
+        github_repo=github_repo, target_file=target_file, dag_id=dag_id, task_id=task_id,
+        run_id=run_id, doc_id=doc_id, root_cause=root_cause, new_source=new_source,
+        proposed_fix=proposed_fix, fallback_reason=fix_error or None,
+        confidence_score=result["score"],
+    ))
+    store.upsert_run(doc_id, {
+        "status": "opened", "pr_number": int(pr["pr_number"]), "pr_url": pr["pr_url"],
+        "diff_applied": pr["diff_applied"], "fallback_reason": pr["fallback_reason"],
+    })
+    return {"status": "opened", "pr_url": pr["pr_url"], "confidence_score": result["score"]}
+
+================================================================================
+FILE: app\reconcile.py
+================================================================================
+
+import logging
+
+from app import outcomes, store
+
+logger = logging.getLogger(__name__)
+
+
+def reconcile_open_prs(limit: int = 200) -> list:
+
+    from github import Auth, Github
+    from app.github_ops import get_github_token
+
+    clients, report = {}, []
+    for run in store.query_runs("status", "opened", limit):
+        doc_id, repo, pr_number = run["id"], run.get("github_repo"), run.get("pr_number")
+        entry = {"id": doc_id, "dag_id": run.get("dag_id"), "pr_number": pr_number}
+        if not repo or pr_number is None:
+            report.append({**entry, "result": "missing_pr_info"})
+            continue
+        try:
+            if repo not in clients:
+                clients[repo] = Github(auth=Auth.Token(get_github_token(repo)))
+            pr = clients[repo].get_repo(repo).get_pull(int(pr_number))
+        except Exception as e:
+            logger.warning("reconcile: could not fetch PR #%s in %s: %s", pr_number, repo, e)
+            report.append({**entry, "result": "github_error", "error": str(e)[:200]})
+            continue
+
+        if pr.state != "closed":
+            report.append({**entry, "result": "still_open"})
+            continue
+
+        outcome = outcomes.record_outcome(doc_id, run, merged=bool(pr.merged), source="reconcile")
+        report.append({**entry, "result": outcome["status"], "merged": bool(pr.merged)})
+    return report
+
+================================================================================
+FILE: app\repos_store.py
+================================================================================
+
+import json
+import os
+
+from google.cloud import storage
+
+_BUCKET = os.environ.get("REPOS_CONFIG_BUCKET")
+_BLOB_NAME = os.environ.get("REPOS_CONFIG_BLOB", "repos.json")
+_client = None
+_cache = None
+
+
+def _bucket():
+    global _client
+    if _client is None:
+        _client = storage.Client()
+    return _client.bucket(_BUCKET)
+
+
+def load_repos(force: bool = False) -> dict:
+    global _cache
+    if _cache is not None and not force:
+        return _cache
+
+    blob = _bucket().blob(_BLOB_NAME)
+    if not blob.exists():
+        _cache = {}
+        return _cache
+
+    _cache = json.loads(blob.download_as_text())
+    return _cache
+
+
+def save_repos(data: dict):
+    global _cache
+    blob = _bucket().blob(_BLOB_NAME)
+    blob.upload_from_string(json.dumps(data, indent=2), content_type="application/json")
+    _cache = data
+
+
+def add_repo(github_repo: str, token_secret: str, dag_path_template: str, set_default: bool = False):
+    data = load_repos(force=True)
+    data[github_repo] = {"token_secret": token_secret, "dag_path_template": dag_path_template}
+    if set_default or "default" not in data:
+        data["default"] = github_repo
+    save_repos(data)
+    return data
+
+def delete_repo(github_repo: str):
+    data = load_repos(force=True)
+    data.pop(github_repo, None)
+    if data.get("default") == github_repo:
+        data.pop("default", None)
+    save_repos(data)
+    return data
+
+def resolve_repo(dag_id: str) -> dict:
+    data = load_repos()
+    overrides = data.get("dag_overrides", {})
+    github_repo = overrides.get(dag_id) or data.get("default")
+    if not github_repo or github_repo not in data:
+        raise ValueError("no default github repo registered — add one from the dashboard")
+    template = data[github_repo].get("dag_path_template", "dags/{dag_id}.py")
+    return {"github_repo": github_repo, "target_file": template.format(dag_id=dag_id)}
+
+
+================================================================================
+FILE: app\store.py
+================================================================================
+
+import json
+import os
+import time
+from datetime import datetime, timezone
+
+from google.cloud import firestore
+
+_client = None
+WEIGHTS_SEED_PATH = os.environ.get("WEIGHTS_SEED_PATH", "config/weights.json")
+IN_PROGRESS = ("processing", "scoring", "generating")
+
+
+def _db():
+    global _client
+    if _client is None:
+        _client = firestore.Client()
+    return _client
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _seed() -> dict:
+    with open(WEIGHTS_SEED_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def run_id_for(run_id: str, task_id: str) -> str:
+    safe = f"{run_id}-{task_id}"
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in safe)
+
+
+def get_run(doc_id: str):
+    snap = _db().collection("runs").document(doc_id).get()
+    return snap.to_dict() if snap.exists else None
+
+
+def upsert_run(doc_id: str, fields: dict):
+    fields = dict(fields)
+    fields["updated_at"] = _now()
+    ref = _db().collection("runs").document(doc_id)
+    if not ref.get().exists:
+        fields.setdefault("created_at", fields["updated_at"])
+    ref.set(fields, merge=True)
+
+
+def claim_run(doc_id: str, fields: dict, stale_after: int, max_attempts: int) -> str:
+    ref = _db().collection("runs").document(doc_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        run = snap.to_dict() if snap.exists else {}
+        status = run.get("status")
+        if status in IN_PROGRESS:
+            if time.time() - run.get("started_at", 0) < stale_after:
+                return "in_progress"
+        elif status and status != "error":
+            return "duplicate_skipped"
+
+        now = _now()
+        attempts = run.get("attempts", 0) + 1
+        if attempts > max_attempts:
+            txn.set(ref, {"status": "error", "error": "gave up after repeated failures", "updated_at": now}, merge=True)
+            return "error_giving_up"
+
+        txn.set(ref, {
+            **fields, "status": "processing", "attempts": attempts, "started_at": time.time(),
+            "updated_at": now, "created_at": run.get("created_at", now),
+        }, merge=True)
+        return "claimed"
+
+    return _txn(_db().transaction())
+
+
+def transition_status(doc_id: str, from_statuses, to_status: str, extra: dict = None):
+    db = _db()
+    ref = db.collection("runs").document(doc_id)
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        if not snap.exists:
+            return None
+        current = (snap.to_dict() or {}).get("status")
+        if current not in from_statuses:
+            return current
+        txn.update(ref, {**(extra or {}), "status": to_status, "updated_at": _now()})
+        return True
+
+    return _txn(db.transaction())
+
+
+def find_by_pr_number(pr_number, github_repo: str = None):
+    docs = []
+    for candidate in (int(pr_number), str(pr_number)):
+        docs = list(_db().collection("runs").where("pr_number", "==", candidate).limit(20).stream())
+        if docs:
+            break
+    if not docs:
+        return None, None
+
+    if github_repo:
+        same_repo = [d for d in docs if (d.to_dict().get("github_repo") or "").lower() == github_repo.lower()]
+        docs = same_repo or docs
+    docs.sort(key=lambda d: d.to_dict().get("status") != "opened")
+    return docs[0].id, docs[0].to_dict()
+
+
+def list_runs(limit: int = 200):
+    docs = (
+        _db().collection("runs")
+        .order_by("updated_at", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+        .stream()
+    )
+    results = []
+    for d in docs:
+        data = d.to_dict()
+        data["id"] = d.id
+        results.append(data)
+    return results
+
+
+def delete_run(doc_id: str):
+    _db().collection("runs").document(doc_id).delete()
+
+
+def query_runs(field: str, value, limit: int = 50):
+    out = []
+    for d in _db().collection("runs").where(field, "==", value).limit(limit).stream():
+        data = d.to_dict()
+        data["id"] = d.id
+        out.append(data)
+    return out
+
+
+def get_weights() -> dict:
+    ref = _db().collection("config").document("weights")
+    snap = ref.get()
+    seed = _seed()
+    if snap.exists:
+        cfg = snap.to_dict()
+        for name, w in seed["weights"].items():
+            cfg["weights"].setdefault(name, w)
+        return cfg
+    ref.set(seed)
+    return seed
+
+
+def save_weights(cfg: dict):
+    _db().collection("config").document("weights").set(cfg, merge=True)
+
+
+def update_weights(mutator) -> dict:
+    db = _db()
+    ref = db.collection("config").document("weights")
+    seed = _seed()
+
+    @firestore.transactional
+    def _txn(txn):
+        snap = ref.get(transaction=txn)
+        cfg = snap.to_dict() if snap.exists else json.loads(json.dumps(seed))
+        for name, w in seed["weights"].items():
+            cfg["weights"].setdefault(name, w)
+        new_cfg = mutator(cfg)
+        txn.set(ref, new_cfg, merge=True)
+        return new_cfg
+
+    return _txn(db.transaction())
+
+
+def append_weight_snapshot(weights: dict, source: str, run_doc_id=None, merged=None, **extra):
+    _db().collection("weight_history").add({
+        "ts": _now(),
+        "weights": dict(weights), "source": source,
+        "run_id": run_doc_id, "merged": merged,
+        **extra,
+    })
+
+
+def list_weight_history(limit: int = 500):
+    docs = (_db().collection("weight_history")
+            .order_by("ts", direction=firestore.Query.DESCENDING).limit(limit).stream())
+    return list(reversed([d.to_dict() for d in docs]))
+
+================================================================================
+FILE: app\tuning.py
+================================================================================
+
+import logging
+
+from app import diff_utils, store
+
+logger = logging.getLogger(__name__)
+
+SMALL_DIFF_LINES = 3
+WEIGHT_FLOOR = 0.01
+
+
+def apply_outcome(run: dict, merged: bool, proposed_fix: str = "", doc_id: str = None) -> dict:
+
+    if run.get("diff_applied") is False:
+        return {"applied": False, "reason": "no fix was proposed"}
+
+    shares = run.get("confidence_shares")
+    confidence_score = run.get("confidence_score")
+    if not shares or confidence_score is None:
+        return {"applied": False, "reason": "run has no confidence_shares/score"}
+
+    small = bool(merged) and diff_utils.diff_line_count(proposed_fix) < SMALL_DIFF_LINES
+    deltas = {}
+
+    def mutate(cfg):
+        step = cfg["penalty"]
+        weights = dict(cfg["weights"])
+        deltas.clear()
+        for name, share in shares.items():
+            if name not in weights:
+                continue
+            if merged and not small:
+                change = step * share
+            elif merged and small:
+                change = 0.0
+            else:
+                change = -step * confidence_score * share
+            new = max(WEIGHT_FLOOR, weights[name] + change)
+            deltas[name] = round(new - weights[name], 6)
+            weights[name] = new
+        cfg["weights"] = weights
+        return cfg
+
+    cfg = store.update_weights(mutate)
+    inactive = sorted(n for n, s in shares.items() if not s)
+    branch = "reward" if (merged and not small) else "small_diff_penalty" if merged else "closed_penalty"
+
+    store.append_weight_snapshot(
+        cfg["weights"], source="outcome", run_doc_id=doc_id, merged=merged,
+        deltas=deltas, inactive_signals=inactive, branch=branch,
+    )
+    summary = {"applied": True, "branch": branch, "deltas": deltas, "inactive_signals": inactive}
+    if doc_id:
+        store.upsert_run(doc_id, {"tuning": summary})
+    logger.info("tuning: run=%s merged=%s branch=%s deltas=%s inactive=%s",
+                doc_id, merged, branch, deltas, inactive)
+    return summary
+
+================================================================================
+FILE: audit.py
+================================================================================
+
+import sys
+from collections import Counter
+
+from google.cloud import firestore
+
+since = sys.argv[1] if len(sys.argv) > 1 else ""
+client = firestore.Client(project="dag-failure-agent-v2")
+runs = [{**d.to_dict(), "id": d.id} for d in client.collection("runs").stream()]
+runs = [r for r in runs if r.get("created_at", "") >= since]
+
+in_flight = ("processing", "scoring", "generating")
+bad = []
+for r in runs:
+    status, score, threshold = r.get("status"), r.get("confidence_score"), r.get("threshold")
+    if status == "error" or status in in_flight:
+        bad.append((r["id"], f"stuck or failed: {status} ({r.get('error', '')})"))
+    elif status == "gated" and (score is None or threshold is None or score >= threshold):
+        bad.append((r["id"], f"gated but score {score} >= threshold {threshold}"))
+    elif status != "gated" and not r.get("pr_url"):
+        bad.append((r["id"], f"{status} with no PR"))
+
+print(dict(Counter(r.get("status") for r in runs)))
+print(f"no-fix PRs: {sum(1 for r in runs if r.get('diff_applied') is False)}")
+print(f"runs checked: {len(runs)}  violations: {len(bad)}")
+for run_id, reason in bad:
+    print(f"  {run_id}: {reason}")
+sys.exit(1 if bad else 0)
+
+
+================================================================================
+FILE: cloudbuild.yaml
+================================================================================
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "gcr.io/$PROJECT_ID/dag-failure-agent", "."]
+
+  - name: gcr.io/cloud-builders/docker
+    args: ["push", "gcr.io/$PROJECT_ID/dag-failure-agent"]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - dag-failure-agent
+      - --image=gcr.io/$PROJECT_ID/dag-failure-agent
+      - --region=us-central1
+      - --platform=managed
+      - --allow-unauthenticated
+      - --timeout=600
+      - --set-env-vars=GCP_PROJECT=$PROJECT_ID,GCP_LOCATION=us-central1,GEMINI_MODEL_NAME=gemini-2.5-flash,REPOS_CONFIG_BUCKET=$PROJECT_ID-repos-config,REPOS_CONFIG_BLOB=repos.json,WEIGHTS_SEED_PATH=config/weights.json,AGENT_FAILURE_TOPIC=dagfailures
+
+images:
+  - gcr.io/$PROJECT_ID/dag-failure-agent
+
+================================================================================
+FILE: composer-env-config.txt
+================================================================================
+
+[Unable to read this file]
+
+
+================================================================================
+FILE: config\weights.json
+================================================================================
+
+{
+  "weights": {
+    "stack_trace_present": 0.25,
+    "line_number_matches_source": 0.35,
+    "known_fix_pattern_match": 0.25,
+    "log_completeness": 0.15,
+    "failure_history" : 0.20
+  },
+  "penalty": 0.05,
+  "threshold": 0.7
+}
+
+
+================================================================================
+FILE: dags\agent_failure_callback.py
+================================================================================
+
+import json
+import os
+from google.cloud import pubsub_v1
+
+_PROJECT = (
+    os.environ.get("DAG_AGENT_GCP_PROJECT")
+    or os.environ.get("GCP_PROJECT")
+    or "dag-failure-agent-v2"
+)
+_TOPIC = os.environ.get("AGENT_FAILURE_TOPIC", "dagfailures")
+
+
+def notify_dag_failure_agent(context):
+    ti = context["task_instance"]
+    dag_run = context["dag_run"]
+
+    payload = {
+        "dag_id": ti.dag_id,
+        "task_id": ti.task_id,
+        "run_id": dag_run.run_id,
+        "try_number": ti.try_number,
+    }
+
+    try:
+        publisher = pubsub_v1.PublisherClient()
+        topic_path = publisher.topic_path(_PROJECT, _TOPIC)
+        future = publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
+        future.result(timeout=30)
+    except Exception as e:
+        print(f"WARNING: could not publish failure event: {e!r}")
+
+
+================================================================================
+FILE: dags\test_batch_type_drift_d8.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def fetch_readings(sensor_id):
+    if sensor_id == "temp-04":
+        return {"value": 71.2, "unit": "F"}
+    return [{"value": 71.2, "unit": "F"}]
+
+
+def collect_all_readings(sensor_ids):
+    all_readings = []
+    for sensor_id in sensor_ids:
+        readings = fetch_readings(sensor_id)
+        all_readings.append(readings)
+    return all_readings
+
+
+def average_value(readings):
+    total = sum(r["value"] for r in readings)
+    return total / len(readings)
+
+
+def summarize_batch(all_readings):
+    summaries = []
+    for readings in all_readings:
+        summaries.append(average_value(readings))
+    return summaries
+
+
+def run_sensor_summary():
+    sensor_ids = ["temp-01", "temp-02", "temp-04"]
+    all_readings = collect_all_readings(sensor_ids)
+    summary = summarize_batch(all_readings)
+    print("summary:", summary)
+
+
+with DAG(
+    dag_id="test_batch_type_drift_d8",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_sensor_summary",
+        python_callable=run_sensor_summary,
+    )
+
+
+================================================================================
+FILE: dags\test_cross_batch_conflict_d10.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+DISCOUNT_CODES = {
+    "WELCOME10": 0.10,
+    "BULK20": 0.20,
+}
+
+BULK_THRESHOLD = 500
+
+
+def lookup_discount_rate(code):
+    return DISCOUNT_CODES[code]
+
+
+def compute_stacked_discount(order):
+    rate = lookup_discount_rate(order["code"])
+    if order["subtotal"] >= BULK_THRESHOLD:
+        rate = min(rate + 0.05, 0.5)
+    return round(order["subtotal"] * rate, 2)
+
+
+def apply_discounts(orders):
+    return [
+        {"order_id": o["order_id"], "discount": compute_stacked_discount(o)}
+        for o in orders
+    ]
+
+
+def run_discount_batch():
+    orders = [
+        {"order_id": "A1", "code": "WELCOME10", "subtotal": 120},
+        {"order_id": "A2", "code": "BULK20", "subtotal": 640},
+        {"order_id": "A3", "code": "FALL25", "subtotal": 610},
+    ]
+    results = apply_discounts(orders)
+    print("results:", results)
+
+
+with DAG(
+    dag_id="test_cross_batch_conflict_d10",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_discount_batch",
+        python_callable=run_discount_batch,
+    )
+
+
+================================================================================
+FILE: dags\test_e2e_proof_d14.py
+================================================================================
+
+"""End-to-end proof DAG for dag-failure-agent.
+
+Three tasks fail on purpose, each exercising a different path through the agent.
+One task succeeds and must NOT create a run record.
+
+  t1_missing_setting   KeyError, one-line fix       -> PR opened, small diff
+  t2_unguarded_none    AttributeError, needs guard  -> PR opened, multi-line diff
+  t3_upstream_outage   RuntimeError, not fixable    -> gated (refused / below threshold)
+  t4_healthy           succeeds                     -> no run row
+"""
+from datetime import datetime
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+# EDIT THIS LINE: copy the exact import and callback name used in dags/test_final_flight_d13.py
+from agent_failure_callback import on_failure
+
+
+def load_region_settings():
+    settings = {"region": "us-east1", "batch_size": 500}
+    batch_limit = settings["max_batch"]
+    print(f"batch limit: {batch_limit}")
+
+
+def find_customer(customer_id):
+    directory = {1001: "acme", 1002: "globex"}
+    return directory.get(customer_id)
+
+
+def format_customer_label():
+    customer = find_customer(1042)
+    label = customer.upper()
+    print(f"customer label: {label}")
+
+
+def pull_warehouse_totals():
+    upstream_status = 503
+    raise RuntimeError(f"warehouse API returned HTTP {upstream_status}; upstream outage")
+
+
+def healthy_task():
+    print("nothing wrong here")
+
+
+with DAG(
+    dag_id="test_e2e_proof_d14",
+    start_date=datetime(2026, 1, 1),
+    schedule=None,
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": on_failure},
+    tags=["agent-proof"],
+) as dag:
+    PythonOperator(task_id="t1_missing_setting", python_callable=load_region_settings)
+    PythonOperator(task_id="t2_unguarded_none", python_callable=format_customer_label)
+    PythonOperator(task_id="t3_upstream_outage", python_callable=pull_warehouse_totals)
+    PythonOperator(task_id="t4_healthy", python_callable=healthy_task)
+
+
+================================================================================
+FILE: dags\test_field_alias_d6.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def normalize_contact(record):
+    return {
+        "name": record["name"],
+        "email": record["email"],
+    }
+
+
+def build_contact_list(records):
+    return [normalize_contact(r) for r in records]
+
+
+def run_contact_sync():
+    records = [
+        {"name": "Priya Nair", "email": "priya@example.com"},
+        {"name": "Sam Ortiz", "email_address": "sam@example.com"},
+        {"name": "Jae Kim", "email": "jae@example.com"},
+    ]
+    contacts = build_contact_list(records)
+    print("contacts:", contacts)
+
+
+with DAG(
+    dag_id="test_field_alias_d6",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_contact_sync",
+        python_callable=run_contact_sync,
+    )
+
+
+================================================================================
+FILE: dags\test_final_flight_d13.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def read_setting(settings, key):
+    return settings[key]
+
+
+def run_final_flight():
+    settings = {"mode": "batch", "region": "us-central1"}
+    print("mode:", read_setting(settings, "mode"))
+    print("owner:", read_setting(settings, "owner"))
+
+
+with DAG(
+    dag_id="test_final_flight_d13",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_final_flight",
+        python_callable=run_final_flight,
+    )
+
+
+# agent fix could not be applied automatically
+# UnidiffParseError: Hunk is shorter than expected
+
+
+================================================================================
+FILE: dags\test_inventory_sync_d11.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def sync_inventory_item(item):
+    return item.get("sku")
+
+def run_inventory_sync():
+    items = [{"sku": "A1", "qty": 5}, {"qty": 3}]  # second item is missing "sku" on purpose
+    results = [sync_inventory_item(i) for i in items]
+    print("synced:", results)
+
+
+with DAG(
+    dag_id="test_inventory_sync_d11",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_inventory_sync",
+        python_callable=run_inventory_sync,
+    )
+
+
+================================================================================
+FILE: dags\test_inventory_sync_retry_d12.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def run_inventory_retry():
+    pending_items = [{"sku": "B7", "location": "east"}, {"location": "west"}]  # second entry missing "sku"
+    for entry in pending_items:
+        print("processing", entry.get("sku"))
+
+
+with DAG(    dag_id="test_inventory_sync_retry_d12",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_inventory_retry",
+        python_callable=run_inventory_retry,
+    )
+
+
+# agent fix could not be applied automatically
+# UnidiffParseError: Hunk is shorter than expected
+
+
+================================================================================
+FILE: dags\test_kv_lookup.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def look_up_service_tier():
+    config = {"environment": "prod", "region": "us-central1"}
+    print("looking up tier for", config["environment"])
+    tier = config["service_tier"]
+    print("tier:", tier)
+
+with DAG(
+    dag_id="test_kv_lookup",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="lookup_service_tier",
+        python_callable=look_up_service_tier,
+    )
+
+================================================================================
+FILE: dags\test_lazy_cache_d2.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+class Connection:
+    def __init__(self, name):
+        self.name = name
+
+    def execute(self, query):
+        return f"ran '{query}' on {self.name}"
+
+
+_CONNECTION_CACHE = {}
+
+
+def get_connection(name):
+    return _CONNECTION_CACHE.get(name)
+
+
+def run_query_on(name, query):
+    conn = get_connection(name)
+    return conn.execute(query)
+
+
+def run_sync_job():
+    result = run_query_on("warehouse", "SELECT 1")
+    print("result:", result)
+
+
+with DAG(
+    dag_id="test_lazy_cache_d2",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_sync_job",
+        python_callable=run_sync_job,
+    )
+
+
+================================================================================
+FILE: dags\test_metrics_gap_d1.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def build_metrics_template():
+    return {"processed": 0, "errors": 0}
+
+
+def record_batch_result(metrics, batch_had_errors, batch_was_skipped):
+    if batch_was_skipped:
+        return
+    metrics["processed"] += 1
+    if batch_had_errors:
+        metrics["errors"] += 1
+
+
+def summarize_metrics(metrics):
+    total = metrics["processed"]
+    error_rate = metrics["errors"] / total if total else 0
+    skipped = metrics["skipped"]
+    return {"total": total, "error_rate": error_rate, "skipped": skipped}
+
+
+def run_metrics_job():
+    metrics = build_metrics_template()
+    record_batch_result(metrics, batch_had_errors=True, batch_was_skipped=False)
+    record_batch_result(metrics, batch_had_errors=False, batch_was_skipped=True)
+    summary = summarize_metrics(metrics)
+    print("summary:", summary)
+
+
+with DAG(
+    dag_id="test_metrics_gap_d1",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_metrics_job",
+        python_callable=run_metrics_job,
+    )
+
+
+================================================================================
+FILE: dags\test_optional_profile_d7.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def find_primary_address(customer):
+    for addr in customer["addresses"]:
+        if addr.get("is_primary"):
+            return addr
+    return None
+
+
+def format_shipping_label(customer):
+    address = find_primary_address(customer)
+    return f"{customer['name']} -> {address.get('line')}"
+
+
+def build_shipping_batch(customers):
+    return [format_shipping_label(c) for c in customers]
+
+
+def run_shipping_batch():
+    customers = [
+        {"name": "Nova Traders", "addresses": [{"line": "12 Elm St", "is_primary": True}]},
+        {"name": "Kestrel Co", "addresses": [{"line": "88 Pine Ave", "is_primary": False}]},
+        {"name": "Arden Ltd", "addresses": [{"line": "4 Oak Blvd", "is_primary": True}]},
+    ]
+    labels = build_shipping_batch(customers)
+    print("labels:", labels)
+
+
+with DAG(
+    dag_id="test_optional_profile_d7",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_shipping_batch",
+        python_callable=run_shipping_batch,
+    )
+
+
+================================================================================
+FILE: dags\test_order_totals_d15.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def line_total(order):
+    gross = order["quantity"] * order["unit_price"]
+    return gross - order["discount"]
+
+
+def build_invoice(orders):
+    totals = []
+    for order in orders:
+        totals.append(line_total(order))
+    return round(sum(totals), 2)
+
+
+def run_invoice_report():
+    orders = [
+        {"id": 1, "quantity": 3, "unit_price": 19.99, "discount": 5.0},
+        {"id": 2, "quantity": 1, "unit_price": 249.0, "discount": 0.0},
+        {"id": 3, "quantity": 12, "unit_price": 4.5},
+    ]
+    print("processing orders:", len(orders))
+    total = build_invoice(orders)
+    print("invoice total:", total)
+
+
+with DAG(
+    dag_id="test_order_totals_d15",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_invoice_report",
+        python_callable=run_invoice_report,
+    )
+
+
+================================================================================
+FILE: dags\test_region_rollup_d5.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+REGION_ORDER = ["west", "east", "central", "other"]
+
+
+def group_orders_by_region(orders):
+    grouped = {region: [] for region in REGION_ORDER}
+    for order in orders:
+        region = order["region"] if order["region"] in grouped else "other"
+        grouped[region].append(order)
+    return grouped
+
+
+def compute_region_subtotal(orders):
+    return sum(order["amount"] for order in orders)
+
+
+def compute_region_totals(grouped_orders):
+    totals = {}
+    for region in REGION_ORDER:
+        totals[region] = compute_region_subtotal(grouped_orders[region])
+    return totals
+
+
+def run_region_rollup():
+    orders = [
+        {"region": "west", "amount": 100},
+        {"region": "south", "amount": 75},
+        {"region": "east", "amount": 50},
+    ]
+    grouped = group_orders_by_region(orders)
+    totals = compute_region_totals(grouped)
+    print("totals:", totals)
+
+
+with DAG(
+    dag_id="test_region_rollup_d5",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_region_rollup",
+        python_callable=run_region_rollup,
+    )
+
+================================================================================
+FILE: dags\test_shared_queue_state_d9.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def enqueue_jobs(jobs, queue=[]):
+    for job in jobs:
+        queue.append(job)
+    return queue
+
+
+def run_batch(queue):
+    if len(queue) > 2:
+        raise ValueError(f"queue exceeded capacity: {len(queue)} jobs, expected at most 2")
+    return [job["id"] for job in queue]
+
+
+def run_job_batch():
+    first_batch = [{"id": "a"}, {"id": "b"}]
+    queue1 = enqueue_jobs(first_batch)
+    result1 = run_batch(queue1)
+    print("first batch result:", result1)
+
+    second_batch = [{"id": "c"}]
+    queue2 = enqueue_jobs(second_batch)
+    result2 = run_batch(queue2)
+    print("second batch result:", result2)
+
+
+with DAG(
+    dag_id="test_shared_queue_state_d9",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_job_batch",
+        python_callable=run_job_batch,
+    )
+
+
+================================================================================
+FILE: dags\test_shipping_tier_d3.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def classify_shipment(weight_kg, is_international):
+    if weight_kg > 50:
+        category = "freight"
+    elif is_international:
+        category = "international_parcel"
+    elif weight_kg > 20:
+        category = "heavy_parcel"
+    else:
+        category = "standard_parcel"
+
+    return category
+
+def build_shipping_label(weight_kg, is_international):
+    category = classify_shipment(weight_kg, is_international)
+    return {"category": category, "weight_kg": weight_kg}
+
+
+def run_labeling():
+    label = build_shipping_label(weight_kg=12, is_international=False)
+    print("label:", label)
+
+
+with DAG(
+    dag_id="test_shipping_tier_d3",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_labeling",
+        python_callable=run_labeling,
+    )
+
+
+================================================================================
+FILE: dags\test_volume_parse_d4.py
+================================================================================
+
+import pendulum
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+from agent_failure_callback import notify_dag_failure_agent
+
+
+def parse_record_value(record):
+    return int(record["value"])
+
+
+def total_daily_volume(records):    total = 0
+    for record in records:
+        total += parse_record_value(record)
+    return total
+
+
+def run_volume_report():
+    records = [{"value": 120}, {"value": "85"}, {"value": 40}]
+    total = total_daily_volume(records)
+    print("total volume:", total)
+
+
+with DAG(
+    dag_id="test_volume_parse_d4",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    default_args={"retries": 0, "on_failure_callback": notify_dag_failure_agent},
+    tags=["agent-test"],
+) as dag:
+    PythonOperator(
+        task_id="run_volume_report",
+        python_callable=run_volume_report,
+    )
+
+
+================================================================================
+FILE: github-webhook-secret.txt
+================================================================================
+
+2c8e51aa622753926f2774e14020c73b7b99b6ce
+
+================================================================================
+FILE: README.md
+================================================================================
+
+# dag-failure-agent
+
+## One-time GCP setup
+
+```
+gcloud services enable run.googleapis.com pubsub.googleapis.com \
+  firestore.googleapis.com secretmanager.googleapis.com \
+  logging.googleapis.com aiplatform.googleapis.com storage.googleapis.com
+
+gcloud firestore databases create --location=us-central1
+
+gsutil mb -l us-central1 gs://YOUR-REPOS-CONFIG-BUCKET
+
+gcloud pubsub topics create dagfailures
+gcloud pubsub subscriptions create dagfailures-push \
+  --topic=dagfailures \
+  --push-endpoint=https://YOUR-CLOUD-RUN-URL/failure \
+  --push-auth-service-account=YOUR-SERVICE-ACCOUNT
+```
+
+Create two Secret Manager secrets before the first run:
+
+```
+gcloud secrets create github-webhook-secret --data-file=- <<< "your-webhook-secret"
+gcloud secrets create github-token-yourrepo --data-file=- <<< "ghp_your_pat"
+```
+
+## Deploy
+
+```
+gcloud builds submit --config cloudbuild.yaml
+```
+
+Set env vars on the Cloud Run service (see `.env.example`) plus grant the
+service's runtime identity: Firestore user, Secret Manager secret accessor
+(on the specific secrets), Storage object admin (on the repos bucket),
+Logging viewer, and Pub/Sub publisher (for the Composer environment's
+service account, to publish to `dagfailures`).
+
+## Register a repo
+
+Open the Cloud Run URL (`/`), fill in the "Add repo" form: `owner/repo`,
+the Secret Manager secret name holding its PAT, and a path template like
+`dags/{dag_id}.py`. Check "default" for your primary repo.
+
+## Wire up Composer
+
+Copy `dags/agent_failure_callback.py` into your Composer environment's
+`dags/` (or a `plugins/`-adjacent import path), then in an
+`airflow_local_settings.py` policy (or directly in each DAG's
+`default_args`):
+
+```python
+from agent_failure_callback import notify_dag_failure_agent
+
+default_args = {"on_failure_callback": notify_dag_failure_agent}
+```
+
+Set `GCP_PROJECT` (and `AGENT_FAILURE_TOPIC` if you didn't use the default
+name `dagfailures`) in the Composer environment's Airflow env vars.
+
+## GitHub webhook
+
+On each registered repo, add a webhook: URL
+`https://YOUR-CLOUD-RUN-URL/github-webhook`, content type
+`application/json`, secret matching `github-webhook-secret`, events:
+just "Pull requests".
+
+## First real test
+
+Trigger one real failing task in Composer. Watch Cloud Run logs, then
+check `/` for the run to appear, gate or open a PR, and — once you close
+or merge that PR — watch the Weights table change.
+
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+
+fastapi
+uvicorn
+google-cloud-pubsub
+google-cloud-firestore
+google-cloud-storage
+google-cloud-secret-manager
+google-cloud-logging
+google-genai
+PyGithub
+
+
